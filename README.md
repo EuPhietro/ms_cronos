@@ -49,6 +49,8 @@ O core nao deve depender de API web, scheduler ou servico Windows. Essas partes 
 
 ## Core Desejado
 
+As especificacoes detalhadas do Core estao em [docs/CORE_SPEC.md](docs/CORE_SPEC.md).
+
 A primeira versao do wrapper deve oferecer uma classe parecida com:
 
 ```python
