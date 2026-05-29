@@ -1,0 +1,8 @@
+# Ignorando venv
+venv/*
+
+# Ignorando caches
+*__pycache___/
+
+# Ignorando variáveis de ambiente
+.env
