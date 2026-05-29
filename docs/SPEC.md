@@ -35,7 +35,6 @@ O projeto deve evitar acoplamento entre as camadas. O Core nao deve saber que ex
 - Criar UI.
 - Criar sincronizacao bidirecional.
 - Criar monitoramento automatico de diretorios na primeira versao.
-- Suportar upload grande na primeira versao.
 - Usar banco complexo na primeira versao.
 - Fazer abstracao generica para todos os recursos do Microsoft Graph.
 - Expor diretamente todos os modelos do `msgraph-sdk`.
@@ -123,11 +122,14 @@ Responsabilidades:
 - criar cliente autenticado do Microsoft Graph;
 - resolver site por URL do SharePoint;
 - obter drive padrao de um site;
+- listar drives de um site;
+- obter drive especifico por identificador;
 - obter raiz do drive;
 - listar filhos de uma pasta;
 - encontrar arquivo ou pasta por nome;
 - criar pasta;
 - enviar arquivo pequeno;
+- enviar arquivo grande;
 - sobrescrever arquivo existente;
 - converter modelos do SDK para dataclasses internas;
 - relancar erros do Graph como erros do projeto.
@@ -185,7 +187,9 @@ class SharePointDriveClient:
     async def close(self) -> None: ...
 
     async def resolve_site(self, sharepoint_url: str) -> SiteRef: ...
+    async def list_site_drives(self, site_id: str) -> list[DriveRef]: ...
     async def get_default_drive(self, site_id: str) -> DriveRef: ...
+    async def get_drive(self, drive_id: str) -> DriveRef: ...
     async def get_drive_root(self, drive_id: str) -> DriveItemRef: ...
 
     async def list_children(
@@ -223,6 +227,16 @@ class SharePointDriveClient:
         local_path: str,
         remote_name: str | None = None,
         conflict_behavior: str = "replace",
+    ) -> UploadResult: ...
+
+    async def upload_large_file(
+        self,
+        drive_id: str,
+        parent_id: str,
+        local_path: str,
+        remote_name: str | None = None,
+        conflict_behavior: str = "replace",
+        chunk_size_bytes: int = 5 * 1024 * 1024,
     ) -> UploadResult: ...
 ```
 
@@ -272,10 +286,10 @@ O Core deve permitir que outra camada realize este fluxo sem conhecer o SDK:
 recebe credenciais
   -> cria cliente Graph
   -> resolve site por URL
-  -> encontra drive padrao
+  -> encontra drive padrao ou drive especifico
   -> encontra pasta de destino
   -> cria pasta se necessario
-  -> envia arquivo
+  -> envia arquivo pequeno ou grande
   -> retorna resultado estavel
 ```
 
@@ -283,6 +297,7 @@ O chamador deve conseguir fazer upload para SharePoint trabalhando apenas com:
 
 - credenciais;
 - URL do site SharePoint;
+- `drive_id` ou escolha do drive via listagem;
 - nome da pasta;
 - caminho local do arquivo;
 - politica de conflito.
@@ -293,17 +308,19 @@ O Core v1 deve suportar:
 
 - apenas SharePoint via Microsoft Graph;
 - apenas autenticacao por credenciais de aplicacao;
-- apenas drive padrao do site;
-- apenas upload simples de arquivo pequeno;
+- drive padrao do site;
+- drives arbitrarios por `drive_id`;
+- listagem de drives de um site;
+- upload simples de arquivo pequeno;
+- upload resumivel de arquivo grande;
 - apenas operacoes em uma pasta por vez;
 - apenas nomes simples de pasta e arquivo;
 - apenas execucao assincrona.
 
 O Core v1 nao deve suportar:
 
-- upload resumivel;
 - upload paralelo em chunks;
-- multiplos drives por alias funcional;
+- descoberta de drive por alias funcional ou apelido configurado;
 - descoberta automatica de site por busca textual;
 - regras de sincronizacao;
 - exclusao de arquivos;
@@ -350,7 +367,7 @@ Entradas aceitas pelo Core:
 - deve existir no disco;
 - deve ser arquivo regular;
 - deve ser legivel pelo processo;
-- nao deve exceder o limite de upload simples do v1.
+- deve poder ser tratado como upload pequeno ou grande conforme o tamanho.
 
 `remote_name`
 
@@ -376,13 +393,16 @@ Regras:
 Saidas por metodo:
 
 - `resolve_site` retorna `SiteRef`.
+- `list_site_drives` retorna `list[DriveRef]`.
 - `get_default_drive` retorna `DriveRef`.
+- `get_drive` retorna `DriveRef`.
 - `get_drive_root` retorna `DriveItemRef`.
 - `list_children` retorna `list[DriveItemRef]`.
 - `find_child` retorna `DriveItemRef | None`.
 - `find_child_folder` retorna `DriveItemRef | None`.
 - `create_folder` retorna `DriveItemRef`.
 - `upload_file` retorna `UploadResult`.
+- `upload_large_file` retorna `UploadResult`.
 
 ### Comportamento por Metodo
 
@@ -407,12 +427,38 @@ Falhas esperadas:
 - valida `site_id`;
 - consulta `/sites/{site-id}/drive`;
 - retorna o drive padrao do site;
-- nao deve listar outros drives no v1.
+- e apenas um atalho para o drive padrao; nao substitui suporte a outros drives.
 
 Falhas esperadas:
 
 - `site_id` vazio;
 - site sem drive padrao acessivel;
+- permissao insuficiente.
+
+`list_site_drives(site_id: str) -> list[DriveRef]`
+
+- valida `site_id`;
+- consulta `/sites/{site-id}/drives`;
+- retorna todos os drives acessiveis do site;
+- deve retornar lista vazia apenas quando o Graph efetivamente retornar colecao vazia.
+
+Falhas esperadas:
+
+- `site_id` vazio;
+- permissao insuficiente;
+- site inexistente.
+
+`get_drive(drive_id: str) -> DriveRef`
+
+- valida `drive_id`;
+- consulta `/drives/{drive-id}`;
+- retorna o drive solicitado;
+- deve funcionar para qualquer drive acessivel, nao apenas o padrao.
+
+Falhas esperadas:
+
+- `drive_id` vazio;
+- drive inexistente;
 - permissao insuficiente.
 
 `get_drive_root(drive_id: str) -> DriveItemRef`
@@ -487,7 +533,25 @@ Regras:
 - deve sobrescrever via `PUT /content` quando o comportamento for `replace`;
 - deve criar novo nome quando o comportamento for `rename`, desde que a rota suportada preserve esse comportamento;
 - deve falhar cedo quando `local_path` nao for arquivo valido;
-- deve falhar cedo quando o tamanho exceder o limite do v1.
+- deve ser usado apenas para arquivos dentro do limite de upload simples;
+- deve falhar cedo quando o tamanho exceder o limite de upload simples.
+
+`upload_large_file(...) -> UploadResult`
+
+- valida argumentos;
+- resolve o nome remoto;
+- valida `chunk_size_bytes`;
+- cria upload session para o arquivo de destino;
+- envia o arquivo em chunks sequenciais;
+- conclui o upload;
+- converte a resposta final para `UploadResult`.
+
+Regras:
+
+- deve ser usado para arquivos acima do limite de upload simples ou quando a camada chamadora decidir explicitamente;
+- `chunk_size_bytes` deve ser multiplo valido aceito pela estrategia de upload;
+- no v1 o envio deve ser sequencial, sem paralelismo;
+- retries de chunk podem ser adicionados, mas a primeira implementacao pode falhar no primeiro erro e retornar contexto claro.
 
 ### Adaptacao entre SDK e Modelos do Projeto
 
@@ -570,6 +634,21 @@ upload_file
   -> adapt_drive_item_to_upload_result
 ```
 
+Fluxo interno recomendado para upload grande:
+
+```text
+upload_large_file
+  -> validate_local_path
+  -> validate_conflict_behavior
+  -> resolve_remote_name
+  -> validate_chunk_size
+  -> build_upload_item_metadata
+  -> create_upload_session
+  -> stream_file_in_chunks
+  -> finalize_upload
+  -> adapt_drive_item_to_upload_result
+```
+
 Fluxo interno recomendado para criar pasta:
 
 ```text
@@ -593,7 +672,8 @@ O Core deve validar antes de chamar o Graph:
 - `conflict_behavior` valido;
 - caminho local existente;
 - caminho local apontando para arquivo;
-- tamanho de arquivo dentro do limite suportado.
+- limite de upload simples ou grande conforme o metodo chamado;
+- `chunk_size_bytes` valido para upload grande.
 
 Validacoes de nome devem ser conservadoras no v1:
 
@@ -615,7 +695,7 @@ Mapeamento sugerido:
 - item esperado como pasta mas recebido como arquivo -> `NotAFolderError`
 - arquivo local inexistente ou inacessivel -> `LocalFileError`
 - conflito invalido -> `UnsupportedConflictBehaviorError`
-- arquivo acima do limite -> `LargeFileUploadNotSupportedError`
+- arquivo acima do limite de upload simples usado no metodo errado -> `LargeFileUploadNotSupportedError`
 
 `GraphRequestError` deve preservar:
 
@@ -663,7 +743,8 @@ Isso significa:
 - evitar expor detalhes do SDK;
 - centralizar montagem de URLs;
 - centralizar adaptacao de modelos;
-- deixar espaco para `createUploadSession` no futuro sem mudar o chamador.
+- suportar `createUploadSession` sem mudar o contrato do chamador;
+- permitir selecao de drives por listagem ou `drive_id` sem acoplamento ao drive padrao.
 
 ### Criterios de Aceite do Core
 
@@ -672,13 +753,16 @@ O Core estara pronto para a primeira entrega quando:
 1. O laboratorio `main.py` usar o Core em vez de chamar o SDK diretamente.
 2. `resolve_site` retornar `SiteRef` valido.
 3. `get_default_drive` retornar `DriveRef` valido.
-4. `get_drive_root` retornar pasta raiz como `DriveItemRef`.
-5. `list_children` funcionar para raiz e subpastas.
-6. `find_child_folder` localizar pasta existente.
-7. `create_folder` criar pasta com comportamento de conflito configuravel.
-8. `upload_file` enviar arquivo pequeno com sucesso.
-9. Nenhum metodo publico do Core retornar objetos do SDK.
-10. O Core nao usar `.env`, `print` ou `rich`.
+4. `list_site_drives` retornar drives acessiveis do site.
+5. `get_drive` retornar qualquer drive acessivel por `drive_id`.
+6. `get_drive_root` retornar pasta raiz como `DriveItemRef`.
+7. `list_children` funcionar para raiz e subpastas.
+8. `find_child_folder` localizar pasta existente.
+9. `create_folder` criar pasta com comportamento de conflito configuravel.
+10. `upload_file` enviar arquivo pequeno com sucesso.
+11. `upload_large_file` enviar arquivo grande com sucesso.
+12. Nenhum metodo publico do Core retornar objetos do SDK.
+13. O Core nao usar `.env`, `print` ou `rich`.
 
 ### Regras do Core
 
@@ -688,18 +772,22 @@ O Core estara pronto para a primeira entrega quando:
 - O Core deve retornar objetos estaveis do projeto.
 - O Core deve encapsular URLs especiais de upload.
 - O Core deve ter mensagens de erro claras.
-- O Core deve limitar upload simples a arquivos pequenos.
+- O Core deve limitar `upload_file` a arquivos pequenos.
+- O Core deve oferecer `upload_large_file` para arquivos grandes.
 
 ### Rotas Graph Usadas
 
 ```http
 GET /sites/{hostname}:/{site-path}
 GET /sites/{site-id}/drive
+GET /sites/{site-id}/drives
+GET /drives/{drive-id}
 GET /drives/{drive-id}/root
 GET /drives/{drive-id}/items/{folder-id}/children
 POST /drives/{drive-id}/items/{folder-id}/children
 PUT /drives/{drive-id}/items/{folder-id}:/{filename}:/content
 PUT /drives/{drive-id}/items/{file-id}/content
+POST /drives/{drive-id}/items/{folder-id}:/{filename}:/createUploadSession
 ```
 
 Essas rotas nao devem aparecer fora do Core.
@@ -1047,7 +1135,10 @@ Casos minimos do Core:
 - validar `conflict_behavior`;
 - rejeitar arquivo inexistente;
 - rejeitar diretorio em vez de arquivo;
-- rejeitar arquivo grande;
+- listar drives do site;
+- buscar drive por `drive_id`;
+- enviar arquivo pequeno;
+- enviar arquivo grande;
 - montar URL de upload com nome escapado.
 
 Casos minimos de Jobs:
@@ -1071,12 +1162,16 @@ Entregaveis:
 - erros proprios;
 - wrapper `SharePointDriveClient`;
 - upload pequeno;
+- upload grande;
+- listagem e acesso a drives arbitrarios;
 - script manual usando o Core.
 
 Criterios de aceite:
 
 - `main.py` nao chama mais o SDK diretamente;
 - um arquivo pequeno pode ser enviado para uma pasta existente;
+- um arquivo grande pode ser enviado para uma pasta existente;
+- um drive nao padrao pode ser acessado por `drive_id`;
 - uma pasta pode ser criada;
 - erros sao legiveis.
 
@@ -1152,8 +1247,8 @@ Entregaveis:
 - Usar `ms_cronos.core` como pacote final para evitar nome generico.
 - Usar SQLite para jobs locais.
 - Usar FastAPI apenas quando a camada API for iniciada.
-- Usar upload simples no Core v1.
-- Deixar upload grande para v2.
+- Suportar upload pequeno e grande ja no Core v1.
+- Expor listagem de drives e acesso por `drive_id` ja no Core v1.
 - Manter o Core sem `rich`, `.env` e `print`.
 - Usar `logging` em todas as camadas produtivas.
 

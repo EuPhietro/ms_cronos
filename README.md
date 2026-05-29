@@ -31,6 +31,8 @@ Fluxo ja validado:
 
 ## Arquitetura Planejada
 
+As especificacoes gerais do projeto estao em [SPEC.md](SPEC.md).
+
 O projeto deve evoluir em camadas pequenas:
 
 ```text
