@@ -264,6 +264,422 @@ class SharePointDriveClient:
 - `remote_name: str`
 - `conflict_behavior: str`
 
+### Objetivo Operacional do Core
+
+O Core deve permitir que outra camada realize este fluxo sem conhecer o SDK:
+
+```text
+recebe credenciais
+  -> cria cliente Graph
+  -> resolve site por URL
+  -> encontra drive padrao
+  -> encontra pasta de destino
+  -> cria pasta se necessario
+  -> envia arquivo
+  -> retorna resultado estavel
+```
+
+O chamador deve conseguir fazer upload para SharePoint trabalhando apenas com:
+
+- credenciais;
+- URL do site SharePoint;
+- nome da pasta;
+- caminho local do arquivo;
+- politica de conflito.
+
+### Limites Funcionais da Primeira Versao
+
+O Core v1 deve suportar:
+
+- apenas SharePoint via Microsoft Graph;
+- apenas autenticacao por credenciais de aplicacao;
+- apenas drive padrao do site;
+- apenas upload simples de arquivo pequeno;
+- apenas operacoes em uma pasta por vez;
+- apenas nomes simples de pasta e arquivo;
+- apenas execucao assincrona.
+
+O Core v1 nao deve suportar:
+
+- upload resumivel;
+- upload paralelo em chunks;
+- multiplos drives por alias funcional;
+- descoberta automatica de site por busca textual;
+- regras de sincronizacao;
+- exclusao de arquivos;
+- renomeacao de arquivos ou pastas;
+- mover arquivos entre pastas;
+- observabilidade baseada em eventos externos.
+
+### Contratos de Entrada
+
+Entradas aceitas pelo Core:
+
+`GraphCredentials`
+
+- `tenant_id` obrigatorio, nao vazio.
+- `client_id` obrigatorio, nao vazio.
+- `client_secret` obrigatorio, nao vazio.
+
+`sharepoint_url`
+
+- deve ser URL absoluta;
+- deve usar `https`;
+- deve conter hostname;
+- deve apontar para um site SharePoint;
+- nao deve incluir sufixos de recurso Graph como `:/drive`.
+
+`site_id`
+
+- deve ser string nao vazia;
+- deve ser o identificador retornado pelo Graph;
+- o Core nao deve tentar adivinhar ou corrigir `site_id`.
+
+`drive_id`
+
+- deve ser string nao vazia;
+- deve ser um identificador de drive, nao de site.
+
+`folder_id`
+
+- deve ser string nao vazia;
+- deve representar um `DriveItem` do tipo pasta.
+
+`local_path`
+
+- deve existir no disco;
+- deve ser arquivo regular;
+- deve ser legivel pelo processo;
+- nao deve exceder o limite de upload simples do v1.
+
+`remote_name`
+
+- quando informado, deve ser string nao vazia;
+- nao deve conter barras ou segmentos de caminho;
+- quando omitido, o nome do arquivo local deve ser usado.
+
+`conflict_behavior`
+
+- valores aceitos no v1: `replace`, `rename`, `fail`;
+- qualquer outro valor deve levantar erro antes da chamada ao Graph.
+
+### Contratos de Saida
+
+O Core deve sempre retornar modelos proprios do projeto.
+
+Regras:
+
+- nunca retornar `Drive`, `Site`, `DriveItem` ou `ODataError` diretamente;
+- nunca retornar `dict` cru do SDK como contrato publico;
+- nunca depender de `additional_data` fora da camada de adaptacao.
+
+Saidas por metodo:
+
+- `resolve_site` retorna `SiteRef`.
+- `get_default_drive` retorna `DriveRef`.
+- `get_drive_root` retorna `DriveItemRef`.
+- `list_children` retorna `list[DriveItemRef]`.
+- `find_child` retorna `DriveItemRef | None`.
+- `find_child_folder` retorna `DriveItemRef | None`.
+- `create_folder` retorna `DriveItemRef`.
+- `upload_file` retorna `UploadResult`.
+
+### Comportamento por Metodo
+
+`resolve_site(sharepoint_url: str) -> SiteRef`
+
+- valida a URL recebida;
+- converte a URL humana do SharePoint para a rota Graph de site;
+- consulta o Graph;
+- extrai o identificador do site;
+- retorna `SiteRef`.
+
+Falhas esperadas:
+
+- URL invalida;
+- URL sem hostname;
+- resposta sem `site_id`;
+- permissao insuficiente;
+- site inexistente.
+
+`get_default_drive(site_id: str) -> DriveRef`
+
+- valida `site_id`;
+- consulta `/sites/{site-id}/drive`;
+- retorna o drive padrao do site;
+- nao deve listar outros drives no v1.
+
+Falhas esperadas:
+
+- `site_id` vazio;
+- site sem drive padrao acessivel;
+- permissao insuficiente.
+
+`get_drive_root(drive_id: str) -> DriveItemRef`
+
+- valida `drive_id`;
+- consulta `/drives/{drive-id}/root`;
+- garante que o item retornado e pasta;
+- retorna `DriveItemRef`.
+
+Falhas esperadas:
+
+- drive inexistente;
+- drive inacessivel;
+- resposta sem `id`.
+
+`list_children(drive_id: str, folder_id: str) -> list[DriveItemRef]`
+
+- valida `drive_id` e `folder_id`;
+- consulta os filhos da pasta;
+- converte a colecao para `DriveItemRef`;
+- retorna lista vazia quando a pasta nao tem filhos.
+
+Falhas esperadas:
+
+- pasta nao encontrada;
+- item informado nao e pasta;
+- permissao insuficiente.
+
+`find_child(drive_id: str, folder_id: str, name: str) -> DriveItemRef | None`
+
+- chama `list_children`;
+- compara por nome exato;
+- retorna o primeiro item encontrado;
+- retorna `None` quando nao existir.
+
+Regras:
+
+- comparacao inicial deve ser exata;
+- no v1 nao deve haver matching parcial nem regex;
+- no v1 a sensibilidade de caixa deve seguir o nome retornado pelo Graph e ser documentada como comparacao exata.
+
+`find_child_folder(drive_id: str, folder_id: str, name: str) -> DriveItemRef | None`
+
+- chama `find_child`;
+- filtra apenas itens do tipo pasta;
+- retorna `None` se o nome existir mas for arquivo.
+
+`create_folder(drive_id: str, parent_id: str, name: str, conflict_behavior: str = "rename") -> DriveItemRef`
+
+- valida `drive_id`, `parent_id`, `name` e `conflict_behavior`;
+- cria um `DriveItem` com facet `Folder`;
+- envia `@microsoft.graph.conflictBehavior`;
+- retorna a pasta criada.
+
+Falhas esperadas:
+
+- item pai nao e pasta;
+- nome invalido;
+- conflito nao permitido pelo comportamento escolhido.
+
+`upload_file(...) -> UploadResult`
+
+- valida argumentos;
+- resolve o nome remoto;
+- le bytes do arquivo local;
+- monta a URL de upload por caminho;
+- executa upload simples;
+- converte resposta para `UploadResult`.
+
+Regras:
+
+- deve sobrescrever via `PUT /content` quando o comportamento for `replace`;
+- deve criar novo nome quando o comportamento for `rename`, desde que a rota suportada preserve esse comportamento;
+- deve falhar cedo quando `local_path` nao for arquivo valido;
+- deve falhar cedo quando o tamanho exceder o limite do v1.
+
+### Adaptacao entre SDK e Modelos do Projeto
+
+O Core deve ter uma camada interna clara de conversao.
+
+Recomendacao:
+
+- uma funcao para converter `Site` ou resposta de resolucao para `SiteRef`;
+- uma funcao para converter `Drive` para `DriveRef`;
+- uma funcao para converter `DriveItem` para `DriveItemRef`;
+- uma funcao para converter resposta de upload para `UploadResult`.
+
+Regras de conversao:
+
+- `is_folder` e `True` quando `item.folder` existir;
+- `is_file` e `True` quando `item.file` existir;
+- `size` pode ser `None`;
+- `name` e `web_url` podem ser `None`, mas `id` nao.
+
+### Estrutura Interna Recomendada do Core
+
+Mesmo que o projeto ainda esteja pequeno, o Core deve ser separado em partes simples.
+
+`core/graph_client.py`
+
+- factory de `GraphServiceClient`;
+- gerenciamento de credenciais;
+- contexto de abertura e fechamento;
+- nenhuma regra de SharePoint.
+
+`core/sharepoint.py`
+
+- API publica do Core;
+- chamadas de fluxo de negocio tecnico;
+- coordenacao entre validacoes, SDK e conversores.
+
+`core/models.py`
+
+- dataclasses publicas;
+- tipos de retorno;
+- nenhum acesso ao Graph.
+
+`core/errors.py`
+
+- hierarquia de erros;
+- mensagens canônicas do Core;
+- nenhum import de `rich`.
+
+`core/urls.py`
+
+- `build_graph_site_url(sharepoint_url: str) -> str`
+- `build_upload_url(drive_id: str, parent_id: str, remote_name: str) -> str`
+- funcoes puras e testaveis.
+
+`core/validators.py`
+
+- validacao de URL;
+- validacao de `conflict_behavior`;
+- validacao de caminho local;
+- validacao de tamanho de arquivo;
+- validacao de nome remoto.
+
+`core/adapters.py`
+
+- adaptacao de modelos do SDK para modelos do projeto;
+- nenhuma regra de negocio fora da traducao.
+
+### Sequencia Interna das Operacoes
+
+Fluxo interno recomendado para upload:
+
+```text
+upload_file
+  -> validate_local_path
+  -> validate_conflict_behavior
+  -> resolve_remote_name
+  -> read_file_bytes
+  -> build_upload_url
+  -> execute_put_content
+  -> adapt_drive_item_to_upload_result
+```
+
+Fluxo interno recomendado para criar pasta:
+
+```text
+create_folder
+  -> validate_name
+  -> validate_conflict_behavior
+  -> build_folder_drive_item
+  -> execute_children_post
+  -> adapt_drive_item_to_ref
+```
+
+### Validacoes Obrigatorias
+
+O Core deve validar antes de chamar o Graph:
+
+- credenciais nao vazias;
+- URL SharePoint bem formada;
+- `site_id`, `drive_id`, `parent_id`, `folder_id` nao vazios;
+- nome de pasta nao vazio;
+- nome remoto nao vazio quando fornecido;
+- `conflict_behavior` valido;
+- caminho local existente;
+- caminho local apontando para arquivo;
+- tamanho de arquivo dentro do limite suportado.
+
+Validacoes de nome devem ser conservadoras no v1:
+
+- bloquear nome vazio;
+- bloquear barra `/`;
+- bloquear barra invertida `\\`;
+- bloquear nomes com espacos apenas.
+
+### Politica de Erros do Core
+
+O Core deve traduzir erros do Graph para erros de dominio tecnico do projeto.
+
+Mapeamento sugerido:
+
+- URL invalida -> `SharePointUrlError`
+- credenciais invalidas -> `GraphConfigurationError`
+- falha de permissao -> `GraphRequestError`
+- item nao encontrado -> `DriveItemNotFoundError`
+- item esperado como pasta mas recebido como arquivo -> `NotAFolderError`
+- arquivo local inexistente ou inacessivel -> `LocalFileError`
+- conflito invalido -> `UnsupportedConflictBehaviorError`
+- arquivo acima do limite -> `LargeFileUploadNotSupportedError`
+
+`GraphRequestError` deve preservar:
+
+- operacao;
+- recurso alvo;
+- codigo do Graph, quando existir;
+- mensagem do Graph, quando existir.
+
+### Politica de Logging no Core
+
+O Core nao deve imprimir no terminal.
+
+Regras:
+
+- nao usar `print`;
+- nao usar `rich`;
+- nao formatar traceback para o usuario final;
+- usar `logging.getLogger(__name__)` apenas quando necessario;
+- nao logar segredo, token ou caminho sensivel sem necessidade.
+
+No v1, o Core pode operar sem logs detalhados se isso simplificar a implementacao, desde que os erros retornem contexto suficiente.
+
+### Politica de Dependencias
+
+O Core deve depender apenas do necessario:
+
+- `azure-identity`
+- `msgraph-sdk`
+- biblioteca padrao
+
+Dependencias que nao pertencem ao Core:
+
+- `python-dotenv`
+- `rich`
+- frameworks web
+- bibliotecas de servico Windows
+
+### Compatibilidade e Evolucao
+
+O Core deve ser desenhado para crescer sem quebrar o contrato do v1.
+
+Isso significa:
+
+- manter a API publica pequena;
+- evitar expor detalhes do SDK;
+- centralizar montagem de URLs;
+- centralizar adaptacao de modelos;
+- deixar espaco para `createUploadSession` no futuro sem mudar o chamador.
+
+### Criterios de Aceite do Core
+
+O Core estara pronto para a primeira entrega quando:
+
+1. O laboratorio `main.py` usar o Core em vez de chamar o SDK diretamente.
+2. `resolve_site` retornar `SiteRef` valido.
+3. `get_default_drive` retornar `DriveRef` valido.
+4. `get_drive_root` retornar pasta raiz como `DriveItemRef`.
+5. `list_children` funcionar para raiz e subpastas.
+6. `find_child_folder` localizar pasta existente.
+7. `create_folder` criar pasta com comportamento de conflito configuravel.
+8. `upload_file` enviar arquivo pequeno com sucesso.
+9. Nenhum metodo publico do Core retornar objetos do SDK.
+10. O Core nao usar `.env`, `print` ou `rich`.
+
 ### Regras do Core
 
 - O Core deve ser assincrono.
