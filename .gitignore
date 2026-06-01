@@ -2,7 +2,8 @@
 venv/*
 
 # Ignorando caches
-*__pycache___/
+*__pycache___/*
+*.pyc
 
 # Ignorando variáveis de ambiente
 .env
