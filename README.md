@@ -36,6 +36,7 @@ O projeto ja possui:
 - obtencao de drive especifico por id;
 - resolucao da raiz do drive;
 - listagem dos filhos de um `DriveItem` pasta;
+- busca imediata de filhos por nome, id e URL web;
 - parse semantico entre models do SDK e models internos;
 - traducao inicial de `ODataError` para erros do Core.
 
@@ -117,6 +118,9 @@ Contem o servico principal, atualmente com operacoes de leitura e navegacao:
 - `get_drive`
 - `get_drive_root`
 - `list_children`
+- `find_child_by_name`
+- `find_child_by_id`
+- `find_child_by_web_url`
 
 ### `core/urls.py`
 
@@ -141,7 +145,8 @@ O `main.py` ainda funciona como laboratorio manual. O fluxo ja exercitado e:
 5. listar drives do site;
 6. obter drive padrao ou drive especifico;
 7. obter o root do drive;
-8. listar filhos da raiz.
+8. listar filhos da raiz;
+9. buscar filhos imediatos por nome, id ou URL web.
 
 ## Proximas Implementacoes
 
@@ -172,6 +177,24 @@ class SharePointService:
         drive_ref: DriveRef,
         parent_item_ref: DriveItemRef,
     ) -> DriveItemCollection: ...
+    async def find_child_by_name(
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        name: str,
+    ) -> DriveItemRef | None: ...
+    async def find_child_by_id(
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        drive_id: str,
+    ) -> DriveItemRef | None: ...
+    async def find_child_by_web_url(
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        web_url: str,
+    ) -> DriveItemRef | None: ...
 ```
 
 ## Microsoft Graph

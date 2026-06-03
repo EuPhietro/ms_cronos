@@ -1,10 +1,17 @@
+"""Helpers para validar URLs humanas do SharePoint e montar rotas Graph.
+
+Este modulo lida apenas com strings de URL. Ele nao chama o Graph e nao valida se
+o site existe; essa responsabilidade pertence ao `SharePointService`.
+
+Exemplo:
+    graph_url = build_graph_site_url(
+        'https://tenant.sharepoint.com/sites/RHConecta'
+    )
+"""
+
 from urllib.parse import urlparse
 
-
-# INTERNAL PACKAGE
-from core import (
-    SharePointUrlError,
-    )
+from core.errors import SharePointUrlError
 
 
 def validate_graph_url(url: str, strict_validate: bool = False) -> bool:
@@ -17,38 +24,36 @@ def validate_graph_url(url: str, strict_validate: bool = False) -> bool:
     - possui hostname.
 
     No modo estrito, tambem exige um path explicito e rejeita caminhos que
-    aparentam ja apontar para sub-recursos, como quando a URL contem mais de um
-    fragmento separado por ':' no path.
+    aparentam ja apontar para sub-recursos Graph.
     """
-    # Se for vazia, não é uma URL válida
+    # URLs vazias ou compostas apenas por espacos nao podem ser resolvidas.
     if not url.strip():
         return False
-    
+
     parts = urlparse(url)
-    
-    # Se não houver schema seguro é inválida
+
+    # O Core exige HTTPS para URLs humanas do SharePoint.
     if parts.scheme != 'https':
         return False
-    
-    # Se não houver host é inválida
+
+    # Sem hostname nao ha tenant SharePoint para resolver.
     if not parts.hostname:
         return False
-    
+
     if strict_validate:
-        # Verifica se paths é vazio
+        # No modo estrito, exigimos path explicito de site.
         if not parts.path:
             return False
         paths_fragments = parts.path.split(':')
-        # Verifica se o path tem mais de 1 fragmento
+        # Paths com mais de um fragmento separado por ':' geralmente indicam
+        # que a URL ja aponta para um sub-recurso Graph.
         if len(paths_fragments) > 1:
-            # EX: GET https://graph.microsoft.com/v1.0/sites/{hostname}:/{site-server-relative-url} = Aceito, fragmento de Path = 1
-            # EX: GET https://graph.microsoft.com/v1.0/sites/{hostname}:/{site-server-relative-url}:/lists/{list-id}/items/{item-id} Não aceito, fragmento de site = 2
             return False
-        
+
         return True
-    
+
     return True
-    
+
 
 def build_graph_site_url(sharepoint_url: str, strict_validate: bool = False) -> str:
     """
@@ -56,21 +61,45 @@ def build_graph_site_url(sharepoint_url: str, strict_validate: bool = False) -> 
     site.
 
     Exemplo:
-    https://tenant.sharepoint.com/sites/RHConecta
-    -> https://graph.microsoft.com/v1.0/sites/tenant.sharepoint.com:/sites/RHConecta
+        https://tenant.sharepoint.com/sites/RHConecta
+        -> https://graph.microsoft.com/v1.0/sites/tenant.sharepoint.com:/sites/RHConecta
 
     Quando a validacao falha, a funcao levanta SharePointUrlError para que a
     camada de servico nao precise conhecer detalhes do parse.
     """
-    # Retorna uma URL formatada, se não, lança um erro
-
-    # Verifica se a URL é valida (tem protocolo, não é vazia e tem host)
+    # A validacao fica centralizada para manter o servico livre de detalhes de
+    # parse de URL.
     if not validate_graph_url(sharepoint_url, strict_validate):
         raise SharePointUrlError
     parts = urlparse(sharepoint_url)
-    
-    # Se não houver complemento, retorna o site raiz
+
+    # Sem path, a URL aponta para o site raiz do tenant.
     if not parts.path:
         return f'https://graph.microsoft.com/v1.0/sites/{parts.hostname}'.rstrip('/')
-    # Se não, retorna o caminho completo com o complemento para o recurso desejado
+    # Com path, usamos a sintaxe Graph `hostname:/server-relative-path`.
     return f'https://graph.microsoft.com/v1.0/sites/{parts.hostname}:{parts.path}'.rstrip('/')
+
+
+def build_create_content_url(filename: str) -> str:
+    """Monta o fragmento Graph usado para criar um arquivo por nome.
+
+    O retorno e apenas o sufixo relativo ao item pai, por exemplo
+    `:/curriculo.pdf:/content`.
+    """
+    return f':/{filename}:/content'
+
+
+def build_drive_create_content_url(
+    drive_id: str,
+    parent_item_id: str,
+    target_path: str,
+) -> str:
+    """Monta a URL Graph completa usada para criar um arquivo pequeno.
+
+    `target_path` deve conter apenas o fragmento relativo ao item pai, por
+    exemplo `:/curriculo.pdf:/content`.
+    """
+    return (
+        f'https://graph.microsoft.com/v1.0/drives/{drive_id}'
+        f'/items/{parent_item_id}{target_path}'
+    )

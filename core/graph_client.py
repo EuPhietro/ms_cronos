@@ -1,3 +1,15 @@
+"""Gerenciamento do cliente autenticado do Microsoft Graph.
+
+Este modulo cria o `GraphServiceClient` a partir de credenciais ja resolvidas
+por outra camada. Ele nao le `.env` e nao conhece regras de SharePoint; sua
+responsabilidade e apenas construir, expor e fechar o client.
+
+Exemplo:
+    manager = GraphClientManager(credentials)
+    client = manager.client
+    await manager.close()
+"""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -16,13 +28,14 @@ class GraphClientManager:
     Responsavel por criar e fechar o ciclo de vida do GraphServiceClient.
 
     Esta classe nao le variaveis de ambiente. Ela recebe um objeto de
-    credenciais ja resolvido por outra camada.
+    credenciais ja resolvido por outra camada e controla a vida util da
+    credencial assincrona do Azure.
     """
 
     def __init__(
         self,
-        credentials: GraphCredentials, # Recebe por parâmetro o model Graph credentials do azure.identity.aio
-        scopes: Sequence[str] | None = None, # Representa uma sequencia de escopo personalizado
+        credentials: GraphCredentials,
+        scopes: Sequence[str] | None = None,
     ) -> None:
         self._credentials = credentials 
         self._scopes = tuple(scopes or DEFAULT_SCOPES)
@@ -40,33 +53,34 @@ class GraphClientManager:
 
     @property
     def credential(self) -> ClientSecretCredential:
-        '''Atributo calculado que retorna credentials'''
+        '''Retorna a credencial assíncrona usada pelo client Graph.'''
         return self._credential
 
     @property
     def client(self) -> GraphServiceClient:
-        '''Atributo calculado que retorna _client'''
+        '''Retorna o `GraphServiceClient` enquanto o manager estiver aberto.'''
         if self._closed:
             raise RuntimeError("Graph client manager is closed.")
         return self._client
 
     @property
     def scopes(self) -> tuple[str, ...]:
-        '''Atributo calculado que retorna _scope'''
+        '''Retorna os scopes configurados para autenticacao no Graph.'''
         return self._scopes
 
     async def close(self) -> None:
-        '''Função que fecha a conexão com o a API'''
+        '''Fecha a credencial subjacente usada pelo client Graph.'''
         if self._closed:
             return
         await self._credential.close()
         self._closed = True
 
-    # Usado pelo gerenciador de contexto With
     async def __aenter__(self) -> GraphClientManager:
+        '''Permite usar o manager com `async with`.'''
         return self
-# Usado pelo gerenciador de contexto With
+
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        '''Garante fechamento da credencial ao sair do contexto assincrono.'''
         await self.close()
 
     @staticmethod
@@ -91,6 +105,7 @@ def create_graph_client_manager(
     credentials: GraphCredentials,
     scopes: Sequence[str] | None = None,
 ) -> GraphClientManager:
+    """Cria um `GraphClientManager` com os scopes informados ou os padroes."""
     return GraphClientManager(credentials=credentials, scopes=scopes)
 
 
@@ -98,4 +113,5 @@ def create_graph_client(
     credentials: GraphCredentials,
     scopes: Sequence[str] | None = None,
 ) -> GraphClientManager:
+    """Alias de compatibilidade para criar o manager do Graph."""
     return create_graph_client_manager(credentials=credentials, scopes=scopes)

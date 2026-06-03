@@ -9,7 +9,7 @@ Este modulo concentra:
 A ideia e que o restante do projeto dependa destes tipos em vez de consumir
 objetos crus do SDK do Microsoft Graph.
 
-Exemplo:
+Exemplo basico:
     credentials = GraphCredentials(
         client_id="app-id",
         client_secret="secret",
@@ -34,20 +34,37 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, ClassVar, Generic, List, Optional, TypeVar,Self
+from typing import (
+    Callable,
+    ClassVar,
+    Generic,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Self,
+    TypeVar,
+    cast,
+)
 
-# Generics
+
+
 # `T` representa o tipo de item armazenado por uma colecao generica.
 T = TypeVar('T')
 
 
-# Generics Classes
 # `CollectionItem` permanece como classe base semantica para identificar os
 # modelos que podem viver dentro das colecoes do Core.
 class CollectionItem(Generic[T], ABC):
-    """Classe base semantica para itens que circulam nas colecoes do Core."""
+    """Marcador semantico para itens que circulam nas colecoes do Core.
+
+    A classe nao adiciona comportamento por enquanto. Ela existe para deixar claro
+    que `SiteRef`, `DriveRef`, `DriveItemRef`, `LocalFile` e `UploadResult` sao
+    modelos internos do Core e podem ser agrupados por colecoes semanticas.
+    """
 
     ...
+
 
 @dataclass(frozen=True)
 class GraphCredentials:
@@ -66,7 +83,7 @@ class GraphCredentials:
     client_secret: str
     tenant_id: str
 
-# --- ITENS DE COLEÇÃO
+
 @dataclass(frozen=True)
 class SiteRef(CollectionItem):
     '''
@@ -80,6 +97,7 @@ class SiteRef(CollectionItem):
             web_url='https://tenant.sharepoint.com/sites/RHConecta',
         )
     '''
+
 
     id: str
     name: str | None
@@ -147,7 +165,12 @@ class LocalFile(CollectionItem):
 
     @classmethod
     def from_path(cls, path: str | Path) -> 'LocalFile':
-        # Adapta um caminho arbitrario para o modelo semantico usado pelo Core.
+        """Cria um `LocalFile` a partir de `str` ou `Path`.
+
+        Este construtor e permissivo: se o caminho ainda nao existir, `size`
+        permanece `None`. Validacoes mais rigidas ficam no parser ou no fluxo de
+        upload.
+        """
         resolved_path = Path(path)
         suffix = resolved_path.suffix or None
         return cls(
@@ -157,6 +180,23 @@ class LocalFile(CollectionItem):
             size=resolved_path.stat().st_size if resolved_path.exists() else None,
         )
 
+    def rename(self, name: str) -> Self:
+        """Retorna uma nova referencia local com outro nome sem mover o arquivo."""
+        return type(self)(self.path, name, self.extension, self.size)
+
+
+@dataclass(frozen=True)
+class StagingContentUpload(CollectionItem):
+    """Representa um upload pequeno ja preparado para envio.
+
+    O objeto guarda:
+    - o arquivo local de origem;
+    - o fragmento de path Graph que identifica o recurso de criacao;
+    - a estrategia semantica de conflito pedida pelo chamador.
+    """
+    file: LocalFile
+    target_path: str
+    conflict_behavior: Literal['fail', 'rename', 'replace'] = 'fail'
 
 @dataclass(frozen=True)
 class UploadResult(CollectionItem):
@@ -177,8 +217,6 @@ class UploadResult(CollectionItem):
     conflict_behavior: str
 
 
-# COLEÇÕES
-
 class Collection_(Generic[T], ABC):
     """Contrato base de leitura para colecoes do Core.
 
@@ -190,37 +228,37 @@ class Collection_(Generic[T], ABC):
         assert collection.counter == 2
         assert collection.first() == 'a'
     """
-    
-    # Cada subclasse concreta informa como um iteravel deve ser materializado
-    # internamente, por exemplo `tuple` para colecoes congeladas e `list` para
-    # colecoes mutaveis.
-    _storage_factory: ClassVar[Callable[...]]
-    
-    def __init__(self):
+
+    # Cada subclasse concreta informa como uma sequencia deve ser materializada
+    # internamente. O tipo fica intencionalmente amplo porque `ClassVar` nao deve
+    # depender do `T` generico da instancia; as subclasses fazem o cast local para
+    # `tuple[T, ...]` ou `list[T]` no ponto de construcao.
+    _storage_factory: ClassVar[Callable[[Iterable[object]], Sequence[object]]]
+
+    def __init__(self) -> None:
         # `_slots` e o armazenamento interno da colecao. As subclasses escolhem
         # a estrutura concreta, por exemplo `tuple` para colecoes congeladas e
         # `list` para colecoes mutaveis.
         self._slots: Sequence[T]
 
-    # Cada subclasse concreta deve saber reconstruir a colecao a partir de um
-    # iteravel arbitrario.
+    # Cada subclasse concreta deve saber reconstruir a colecao a partir de uma
+    # sequencia de itens.
     @classmethod
     @abstractmethod
-    def from_collection(cls, collection: Iterable[T]) -> Self: ...
-        
+    def from_collection(cls, collection: Sequence[T]) -> Self:
+        """Reconstrói a colecao concreta a partir de uma sequencia de itens."""
+        ...
+
     @property
-    def counter(self) -> int: 
+    def counter(self) -> int:
         '''Retorna a quantidade de itens armazenados.'''
         return len(self._slots)
-    
+
     @property
-    def is_empty(self)-> bool: 
+    def is_empty(self) -> bool:
         '''Indica se a colecao nao possui itens.'''
         return len(self._slots) == 0
-    
 
-        
-    
     def first(self) -> Optional[T]:
         '''Retorna o primeiro item ou `None` quando a colecao estiver vazia.'''
         return self._slots[0] if not self.is_empty else None
@@ -229,33 +267,31 @@ class Collection_(Generic[T], ABC):
         '''Devolve uma copia rasa da colecao como lista comum do Python.'''
         return list(self._slots)
 
+    def __iter__(self) -> Iterator[T]:
+        '''Permite iterar diretamente sobre a colecao.'''
+        return self._slots.__iter__()
 
-    def __iter__(self) -> Iterable[T]:
-        '''Permite iterar naturalmente sobre os itens da colecao.'''
-        for i in self._slots:
-            yield i 
-    
-    def __len__(self): 
+    def __len__(self) -> int:
         '''Permite usar `len(colecao)`.'''
         return len(self._slots)
-    
-    def __bool__(self):
+
+    def __bool__(self) -> bool:
         '''Colecoes vazias sao avaliadas como `False`.'''
         return not self.is_empty
-    
+
     def __getitem__(self, key):
         '''Permite acessar itens por indice ou slice.'''
         return self._slots[key]
-    
-    def __contains__(self, item):
+
+    def __contains__(self, item: object) -> bool:
         '''Permite testar pertinencia com o operador `in`.'''
         return item in self._slots
-    
-    
-    
+
+
 @dataclass(frozen=True)
 class FrozenCollection(Collection_[T]):
-    '''Colecao imutavel usada como contrato publico de retorno do Core.
+    '''
+    Colecao imutavel usada como contrato publico de retorno do Core.
 
     Toda operacao que alteraria o conteudo devolve uma nova instancia em vez de
     modificar a colecao atual.
@@ -266,46 +302,44 @@ class FrozenCollection(Collection_[T]):
         assert drives.counter == 1
         assert updated.counter == 2
     '''
-    # Colecoes imutaveis materializam qualquer entrada como tupla.
+    # Colecoes imutaveis materializam a entrada como tupla.
     _storage_factory = tuple
+    # Tupla variadica: zero ou mais itens do tipo `T`.
     _slots: tuple[T, ...] = field(default_factory=tuple, init=True)
-    
-    # Construtor a partir de qualquer iteravel, preservando o tipo concreto da
+
+    # Construtor a partir de uma sequencia, preservando o tipo concreto da
     # subclasse que chamou o metodo.
     @classmethod
-    def from_collection(cls, collection: Iterable[T]) -> Self:
-        # Materializa a entrada como tupla, respeitando a estrategia declarada
-        # pela propria classe concreta.
+    def from_collection(cls, collection: Sequence[T]) -> Self:
+        """Materializa uma sequencia como colecao imutavel do mesmo tipo."""
         if not collection:
             return cls()
-        _slots_: tuple[T,...] = cls._storage_factory(collection)
+        _slots_ = cast(tuple[T, ...], cls._storage_factory(collection))
         return cls(_slots=_slots_)
     
-    def add(self, item: T) -> FrozenCollection[T]:
+
+    def add(self, item: T) -> Self:
         '''Retorna uma nova colecao contendo o item informado ao final.'''
         _new_slots: tuple[T, ...] = (*self._slots, item)
         return type(self).from_collection(_new_slots)
-    
 
-    def extend(self, *items: T) -> FrozenCollection[T]:
+    def extend(self, *items: T) -> Self:
         '''Retorna uma nova colecao contendo os itens atuais e os novos.'''
         _new_slots: tuple[T, ...] = (*self._slots, *items)
-        
+
         return type(self).from_collection(_new_slots)
-    
-    def remove(self, item: T) -> FrozenCollection[T]:
+
+    def remove(self, item: T) -> Self:
         '''Retorna uma nova colecao sem a primeira ocorrencia do item.'''
         updated_slots = list(self._slots)
         updated_slots.remove(item)
         _new_slots: tuple[T, ...] = tuple(updated_slots)
-        
+
         return type(self).from_collection(_new_slots)
-    
-    def clear(self) -> FrozenCollection[T]:
+
+    def clear(self) -> Self:
         '''Retorna uma nova colecao vazia do mesmo tipo.'''
         return type(self).from_collection(())
-    
-
 
 
 @dataclass
@@ -322,18 +356,17 @@ class MutableCollection(Collection_[T]):
     _storage_factory = list
     _slots: list[T] = field(default_factory=list)
 
-    # Construtor a partir de qualquer iteravel, preservando o tipo concreto da
+    # Construtor a partir de uma sequencia, preservando o tipo concreto da
     # subclasse que chamou o metodo.
     @classmethod
-    def from_collection(cls, collection: Iterable[T]) -> Self:
-        # Materializa a entrada como lista, respeitando a estrategia declarada
-        # pela propria classe concreta.
+    def from_collection(cls, collection: Sequence[T]) -> Self:
+        """Materializa uma sequencia como colecao mutavel do mesmo tipo."""
         if not collection:
             return cls()
-        _slots_: list[T] = cls._storage_factory(collection)
+        _slots_ = cast(list[T], cls._storage_factory(collection))
+
         return cls(_slots=_slots_)
-    
-    
+
     def add(self, item: T) -> None:
         '''Adiciona um item ao final da colecao atual.'''
         self._slots.append(item)
@@ -349,7 +382,6 @@ class MutableCollection(Collection_[T]):
     def clear(self) -> None:
         '''Remove todos os itens da colecao atual.'''
         self._slots.clear()
-    
 
 
 @dataclass(frozen=True)
@@ -363,6 +395,7 @@ class SiteRefCollection(FrozenCollection[SiteRef]):
 
     pass
 
+
 @dataclass(frozen=True)
 class DriveRefCollection(FrozenCollection[DriveRef]):
     '''Colecao imutavel de referencias de drives do SharePoint.
@@ -374,6 +407,7 @@ class DriveRefCollection(FrozenCollection[DriveRef]):
 
     pass
 
+
 @dataclass(frozen=True)
 class DriveItemCollection(FrozenCollection[DriveItemRef]):
     '''Colecao imutavel de arquivos e pastas retornados de um drive.
@@ -384,7 +418,7 @@ class DriveItemCollection(FrozenCollection[DriveItemRef]):
     '''
 
     pass
-    
+
 
 @dataclass
 class LocalFileCollection(MutableCollection[LocalFile]):
@@ -396,4 +430,15 @@ class LocalFileCollection(MutableCollection[LocalFile]):
         assert files.is_empty
     '''
 
+    pass
+
+@dataclass 
+class StagingUpdateContentCollection(MutableCollection[StagingContentUpload]):
+    '''Colecao mutavel de arquivos locais prontos para processamento para processamento.
+
+    Exemplo:
+        files = LocalFileCollection(_slots=[local_file])
+        files.clear()
+        assert files.is_empty
+    '''
     pass

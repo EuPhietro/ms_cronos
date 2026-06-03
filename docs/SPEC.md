@@ -98,7 +98,7 @@ O Core e a camada principal da primeira fase.
 - obter drive especifico;
 - obter root do drive;
 - listar filhos de um item pasta;
-- encontrar arquivo ou pasta por nome;
+- encontrar filho imediato por nome, id ou URL web;
 - criar pasta remota;
 - enviar arquivos pequenos e grandes;
 - traduzir modelos e erros do SDK para contratos internos.
@@ -203,6 +203,24 @@ class SharePointService:
         drive_ref: DriveRef,
         parent_item_ref: DriveItemRef,
     ) -> DriveItemCollection: ...
+    async def find_child_by_name(
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        name: str,
+    ) -> DriveItemRef | None: ...
+    async def find_child_by_id(
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        drive_id: str,
+    ) -> DriveItemRef | None: ...
+    async def find_child_by_web_url(
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        web_url: str,
+    ) -> DriveItemRef | None: ...
 ```
 
 ### Operacoes ainda faltantes
@@ -210,7 +228,6 @@ class SharePointService:
 As proximas operacoes previstas para o servico sao:
 
 ```python
-async def find_child(...) -> DriveItemRef | None: ...
 async def find_child_folder(...) -> DriveItemRef | None: ...
 async def create_folder(...) -> DriveItemRef: ...
 async def upload_file(...) -> UploadResult: ...
@@ -271,7 +288,8 @@ O `main.py` hoje e um laboratorio manual. O fluxo ja exercitado no projeto e:
 5. listar drives do site;
 6. obter drive padrao ou drive especifico;
 7. obter o root do drive;
-8. listar os filhos do root.
+8. listar os filhos do root;
+9. buscar filhos imediatos por nome, id ou URL web.
 
 ## ODataError e Traducoes
 
@@ -308,7 +326,6 @@ Isso implica:
 
 ### Primitivas necessarias antes da orquestracao
 
-- `find_child`
 - `find_child_folder`
 - `create_folder`
 - `upload_file`
@@ -325,10 +342,9 @@ Isso implica:
 
 ## Proximos Passos
 
-1. implementar `find_child`;
-2. implementar `find_child_folder`;
-3. implementar `create_folder`;
-4. implementar `upload_file`;
-5. implementar `upload_large_file`;
-6. modelar leitura recursiva local;
-7. orquestrar upload de diretorio.
+1. implementar `find_child_folder`;
+2. implementar `create_folder`;
+3. implementar `upload_file`;
+4. implementar `upload_large_file`;
+5. modelar leitura recursiva local;
+6. orquestrar upload de diretorio.

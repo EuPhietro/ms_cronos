@@ -10,13 +10,14 @@ Responsabilidades principais:
 - adaptar caminhos locais em `LocalFile`;
 - traduzir `ODataError` para a hierarquia de erros interna.
 
-Exemplo:
+Exemplo basico:
     site_ref = parse_site(site)
     drives = parse_drive_collection_response(drive_response)
     local_file = parse_local_file(Path("/tmp/curriculo.pdf"))
 """
 
 from __future__ import annotations
+
 from pathlib import Path
 from typing import Any
 
@@ -42,10 +43,10 @@ from core.errors import (
     SiteResolutionError,
 )
 from core.models import (
-    DriveItemCollection,
-    DriveItemRef,
     DriveRef,
     DriveRefCollection,
+    DriveItemCollection,
+    DriveItemRef,
     LocalFile,
     SiteRef,
     SiteRefCollection,
@@ -53,11 +54,16 @@ from core.models import (
 
 
 def parse_site(site: Site) -> SiteRef:
-    """Converte um `Site` cru do SDK em `SiteRef`."""
+    """Converte um `Site` cru do SDK em `SiteRef`.
+
+    O `id` e obrigatorio porque as proximas chamadas ao Graph dependem dele para
+    navegar por drives e itens.
+    """
     # O parser unitario adapta o model cru do SDK para a referencia enxuta
     # usada pelo Core.
     if not site.id:
-        raise GraphResponseError("A resposta do Graph nao trouxe um site resolvido.")
+        raise GraphResponseError(
+            "A resposta do Graph nao trouxe um site resolvido.")
 
     return SiteRef(
         id=site.id,
@@ -66,26 +72,40 @@ def parse_site(site: Site) -> SiteRef:
         web_url=site.web_url,
     )
 
-def adapt_site(additional_data:dict[str, Any]) -> SiteRef:
+
+def adapt_site(additional_data: dict[str, Any]) -> SiteRef:
+    """Adapta o fallback `additional_data` de resolucao de site para `SiteRef`.
+
+    A rota `sites.with_url(...).get()` pode devolver os campos do site nesse
+    dicionario, em vez de preencher `response.value`.
+    """
+    # O fallback usa nomes exatamente como o Graph envia em `additional_data`.
     id = additional_data.get('id')
     name = additional_data.get('name')
     display_name = additional_data.get('displayName')
-    web_url= additional_data.get('webUrl')
+    web_url = additional_data.get('webUrl')
     if not id:
-        raise GraphResponseError("A resposta do Graph nao trouxe um site resolvido.")
+        raise GraphResponseError(
+            "A resposta do Graph nao trouxe um site resolvido.")
     return SiteRef(
         id,
         name,
         display_name,
         web_url
     )
-    
+
+
 def parse_drive(drive: Drive) -> DriveRef:
-    """Converte um `Drive` cru do SDK em `DriveRef`."""
+    """Converte um `Drive` cru do SDK em `DriveRef`.
+
+    `DriveRef` representa uma document library ou drive que pode ser usado nas
+    rotas `/drives/{drive-id}/...`.
+    """
     # Drives do SDK carregam muitos detalhes; aqui o Core retira apenas o
     # contrato minimo que sera reutilizado nas proximas operacoes.
     if not drive.id:
-        raise GraphResponseError("A resposta do Graph nao trouxe um drive valido.")
+        raise GraphResponseError(
+            "A resposta do Graph nao trouxe um drive valido.")
 
     return DriveRef(
         id=drive.id,
@@ -96,11 +116,16 @@ def parse_drive(drive: Drive) -> DriveRef:
 
 
 def parse_drive_item(drive_item: DriveItem) -> DriveItemRef:
-    """Converte um `DriveItem` cru do SDK em `DriveItemRef`."""
+    """Converte um `DriveItem` cru do SDK em `DriveItemRef`.
+
+    O Graph usa o mesmo model para arquivos e pastas. O Core preserva essa
+    distincao nos flags `is_folder` e `is_file`.
+    """
     # A presenca das facets `folder` e `file` e o que permite distinguir com
     # seguranca se o item representa uma pasta ou um arquivo.
     if not drive_item.id:
-        raise GraphResponseError("A resposta do Graph nao trouxe um item de drive valido.")
+        raise GraphResponseError(
+            "A resposta do Graph nao trouxe um item de drive valido.")
 
     return DriveItemRef(
         id=drive_item.id,
@@ -112,12 +137,19 @@ def parse_drive_item(drive_item: DriveItem) -> DriveItemRef:
     )
 
 
-def parse_local_file(path: Path) -> LocalFile:
-    """Converte um caminho local valido em `LocalFile`."""
+def parse_local_file(path: Path | str) -> LocalFile:
+    """Converte um caminho local valido em `LocalFile`.
+
+    Diferente de `LocalFile.from_path`, este parser valida que o caminho existe e
+    aponta para arquivo antes de devolver o model interno.
+    """
     # Este parser adapta um caminho local para o modelo interno que depois pode
     # ser usado por upload e validacoes de arquivo.
+    path = Path(path)
+    
     if not path.is_file():
-        raise NotAFileError(f"O caminho informado nao aponta para um arquivo: {path}")
+        raise NotAFileError(
+            f"O caminho informado nao aponta para um arquivo: {path}")
 
     return LocalFile(
         path=path,
@@ -130,13 +162,19 @@ def parse_local_file(path: Path) -> LocalFile:
 def parse_site_collection_response(
     site_collection_response: SiteCollectionResponse,
 ) -> SiteRefCollection:
-    """Converte um envelope de sites do SDK em `SiteRefCollection`."""
+    """Converte um envelope de sites do SDK em `SiteRefCollection`.
+
+    Use quando a resposta esperada for uma colecao real de sites, nao a rota
+    especial `sites.with_url(...)`, que pode exigir `adapt_site`.
+    """
     # Os envelopes de colecao do SDK chegam com `value`; o Core transforma cada
     # item e no final materializa a colecao semantica concreta.
     if not site_collection_response.value:
-        raise GraphResponseError("A resposta do Graph nao trouxe sites resolvidos.")
+        raise GraphResponseError(
+            "A resposta do Graph nao trouxe sites resolvidos.")
 
-    site_ref_collection = [parse_site(site) for site in site_collection_response.value]
+    site_ref_collection = [parse_site(site)
+                           for site in site_collection_response.value]
     return SiteRefCollection.from_collection(site_ref_collection)
 
 
@@ -147,20 +185,27 @@ def parse_drive_collection_response(
     # O fluxo aqui e o mesmo de sites: validar o envelope, adaptar cada drive e
     # reconstruir a colecao concreta do Core.
     if not drive_collection_response.value:
-        raise GraphResponseError("A resposta do Graph nao trouxe drives resolvidos.")
+        raise GraphResponseError(
+            "A resposta do Graph nao trouxe drives resolvidos.")
 
-    drive_ref_collection = [parse_drive(drive) for drive in drive_collection_response.value]
+    drive_ref_collection = [parse_drive(drive)
+                            for drive in drive_collection_response.value]
     return DriveRefCollection.from_collection(drive_ref_collection)
 
 
 def parse_drive_item_collection_response(
     drive_item_collection_response: DriveItemCollectionResponse,
 ) -> DriveItemCollection:
-    """Converte um envelope de itens do SDK em `DriveItemCollection`."""
+    """Converte um envelope de itens do SDK em `DriveItemCollection`.
+
+    Este parser e usado por listagens de filhos. Se a regra de negocio passar a
+    aceitar pastas vazias como retorno valido, este e o ponto que deve materializar
+    `DriveItemCollection` vazia em vez de erro.
+    """
     # Itens de drive podem ser arquivos ou pastas, entao a adaptacao de cada
     # elemento preserva essas duas informacoes no modelo interno.
     if not drive_item_collection_response.value:
-        raise GraphResponseError("A resposta do Graph nao trouxe itens de drive.")
+       return DriveItemCollection()
 
     drive_item_ref_collection = [
         parse_drive_item(drive_item)
@@ -169,18 +214,19 @@ def parse_drive_item_collection_response(
     return DriveItemCollection.from_collection(drive_item_ref_collection)
 
 
-
 def parse_o_data_error(
     o_data_error: ODataError,
     *,
     operation: str | None = None,
-) -> MSCronosError:
+    ) -> MSCronosError:
     """Traduz `ODataError` do SDK para um erro semantico do Core.
 
     O parse considera primeiro o `error.code` retornado pelo Graph e depois, nos
     casos de recurso ausente, refina a classe final usando o contexto da
     operacao que falhou.
     """
+    # A estrutura tipica do SDK e `ODataError.error.code/message`. Quando essa
+    # estrutura nao vem preenchida, o parser recorre a `primary_message`.
     error = o_data_error.error
     code = (error.code or "").strip() if error else ""
     normalized_code = code.casefold()
@@ -223,3 +269,4 @@ def parse_o_data_error(
     return GraphRequestError(message)
 
 
+    
