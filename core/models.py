@@ -48,7 +48,6 @@ from typing import (
 )
 
 
-
 # `T` representa o tipo de item armazenado por uma colecao generica.
 T = TypeVar('T')
 
@@ -97,8 +96,6 @@ class SiteRef(CollectionItem):
             web_url='https://tenant.sharepoint.com/sites/RHConecta',
         )
     '''
-
-
     id: str
     name: str | None
     display_name: str | None
@@ -162,7 +159,7 @@ class LocalFile(CollectionItem):
     name: str
     extension: str | None
     size: int | None
-
+ 
     @classmethod
     def from_path(cls, path: str | Path) -> 'LocalFile':
         """Cria um `LocalFile` a partir de `str` ou `Path`.
@@ -230,19 +227,15 @@ class Collection_(Generic[T], ABC):
     """
 
     # Cada subclasse concreta informa como uma sequencia deve ser materializada
-    # internamente. O tipo fica intencionalmente amplo porque `ClassVar` nao deve
-    # depender do `T` generico da instancia; as subclasses fazem o cast local para
-    # `tuple[T, ...]` ou `list[T]` no ponto de construcao.
+    # internamente. O tipo fica propositalmente amplo porque `ClassVar` nao
+    # deve depender do `T` generico da instancia.
     _storage_factory: ClassVar[Callable[[Iterable[object]], Sequence[object]]]
 
     def __init__(self) -> None:
-        # `_slots` e o armazenamento interno da colecao. As subclasses escolhem
-        # a estrutura concreta, por exemplo `tuple` para colecoes congeladas e
-        # `list` para colecoes mutaveis.
+        # `_slots` e o armazenamento interno compartilhado por todas as
+        # colecoes. Cada subclasse define se ele sera tupla ou lista.
         self._slots: Sequence[T]
 
-    # Cada subclasse concreta deve saber reconstruir a colecao a partir de uma
-    # sequencia de itens.
     @classmethod
     @abstractmethod
     def from_collection(cls, collection: Sequence[T]) -> Self:
@@ -302,13 +295,9 @@ class FrozenCollection(Collection_[T]):
         assert drives.counter == 1
         assert updated.counter == 2
     '''
-    # Colecoes imutaveis materializam a entrada como tupla.
     _storage_factory = tuple
-    # Tupla variadica: zero ou mais itens do tipo `T`.
     _slots: tuple[T, ...] = field(default_factory=tuple, init=True)
 
-    # Construtor a partir de uma sequencia, preservando o tipo concreto da
-    # subclasse que chamou o metodo.
     @classmethod
     def from_collection(cls, collection: Sequence[T]) -> Self:
         """Materializa uma sequencia como colecao imutavel do mesmo tipo."""
@@ -351,13 +340,9 @@ class MutableCollection(Collection_[T]):
         files.add('b.txt')
         assert files.counter == 2
     '''
-
-    # Colecoes mutaveis materializam qualquer entrada como lista.
     _storage_factory = list
     _slots: list[T] = field(default_factory=list)
 
-    # Construtor a partir de uma sequencia, preservando o tipo concreto da
-    # subclasse que chamou o metodo.
     @classmethod
     def from_collection(cls, collection: Sequence[T]) -> Self:
         """Materializa uma sequencia como colecao mutavel do mesmo tipo."""
@@ -434,11 +419,11 @@ class LocalFileCollection(MutableCollection[LocalFile]):
 
 @dataclass 
 class StagingUpdateContentCollection(MutableCollection[StagingContentUpload]):
-    '''Colecao mutavel de arquivos locais prontos para processamento para processamento.
+    '''Colecao mutavel de uploads pequenos ja preparados para envio.
 
     Exemplo:
-        files = LocalFileCollection(_slots=[local_file])
-        files.clear()
-        assert files.is_empty
+        staged = StagingUpdateContentCollection(_slots=[staging_content])
+        staged.clear()
+        assert staged.is_empty
     '''
     pass

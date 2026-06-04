@@ -73,10 +73,11 @@ def build_graph_site_url(sharepoint_url: str, strict_validate: bool = False) -> 
         raise SharePointUrlError
     parts = urlparse(sharepoint_url)
 
-    # Sem path, a URL aponta para o site raiz do tenant.
+    # Sem path, a URL aponta para o site raiz do tenant e o Graph aceita apenas
+    # o hostname como alvo de resolucao.
     if not parts.path:
         return f'https://graph.microsoft.com/v1.0/sites/{parts.hostname}'.rstrip('/')
-    # Com path, usamos a sintaxe Graph `hostname:/server-relative-path`.
+    # Com path, o Graph exige a sintaxe `hostname:/server-relative-path`.
     return f'https://graph.microsoft.com/v1.0/sites/{parts.hostname}:{parts.path}'.rstrip('/')
 
 

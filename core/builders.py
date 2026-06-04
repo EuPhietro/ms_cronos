@@ -17,9 +17,7 @@ from core.urls import build_create_content_url
 
 
 ConflictBehavior = Literal["fail", "rename", "replace"]
-
 ALLOWED_CONFLICT_BEHAVIORS: set[str] = {"fail", "rename", "replace"}
-    
 
 def _normalize_remote_name(name: str) -> str:
     """Normaliza e valida um nome remoto simples de arquivo ou pasta."""
@@ -36,7 +34,7 @@ def _normalize_remote_name(name: str) -> str:
 def _normalize_conflict_behavior(
     conflict_behavior: ConflictBehavior | str,
 ) -> ConflictBehavior:
-    """Normaliza e valida o comportamento de conflito usado pelo Core."""
+    """Normaliza e valida a estrategia de conflito usada pelo Core."""
     normalized_conflict_behavior = conflict_behavior.strip().casefold()
     if normalized_conflict_behavior not in ALLOWED_CONFLICT_BEHAVIORS:
         raise InvalidConflictBehaviorError(
@@ -54,8 +52,8 @@ def build_folder_drive_item(
     O Graph espera um `DriveItem` com `name`, a facet `folder` e o valor especial
     `@microsoft.graph.conflictBehavior` em `additional_data`.
     """
-    # Pasta remota e criada por body JSON, entao o builder entrega o model do
-    # SDK ja pronto para `children.post(...)`.
+    # Pastas remotas sao criadas por body JSON, entao o builder entrega o model
+    # do SDK pronto para `children.post(...)`.
     folder_name = _normalize_remote_name(name)
     normalized_conflict_behavior = _normalize_conflict_behavior(conflict_behavior)
 
@@ -74,8 +72,8 @@ def build_upload_content(
     de caminho que identifica o recurso de criacao por nome, por exemplo
     `:/curriculo.pdf:/content`.
     """
-    # O nome remoto pode vir explicitamente do chamador ou cair para o nome do
-    # proprio arquivo local.
+    # O nome remoto pode ser sobrescrito pelo chamador ou reaproveitar o nome do
+    # arquivo local quando o upload mantiver a identidade original.
     remote_file_name = _normalize_remote_name(remote_name or file.name)
     normalized_conflict_behavior = _normalize_conflict_behavior(conflict_behavior)
 

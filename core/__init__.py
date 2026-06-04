@@ -9,8 +9,7 @@ Regra pratica:
     quando estiver trabalhando dentro da propria implementacao do Core.
 """
 
-# O pacote expõe primeiro os modelos publicos porque eles servem como contrato
-# de dados entre o Core e as camadas superiores.
+# Modelos e colecoes formam o contrato de dados mais basico do Core.
 from core.models import (
     Collection_,
     DriveItemCollection,
@@ -28,17 +27,16 @@ from core.models import (
     UploadResult,
 )
 
-# Este bloco concentra a porta de entrada da integracao com o Microsoft Graph:
-# criacao do client, gerenciamento da credencial e ciclo de vida da conexao.
+# Integracao com o Microsoft Graph: criacao do client e ciclo de vida da
+# credencial assincrona.
 from core.graph_client import (
     GraphClientManager,
     create_graph_client,
     create_graph_client_manager,
 )
 
-# Aqui ficam todos os erros semanticos do projeto. Reexportar esse conjunto no
-# pacote evita que o chamador precise conhecer a estrutura interna de modulos
-# para capturar falhas do Core de forma consistente.
+# Erros publicos do Core, reexportados para que outras camadas nao precisem
+# conhecer a estrutura interna de modulos.
 from core.errors import (
     DefaultDriveNotFoundError,
     DriveItemNotFoundError,
@@ -84,8 +82,7 @@ from core.parse import (
     parse_site_collection_response,
 )
 
-# Helpers de URL usados para validar entradas do SharePoint e montar as rotas
-# especiais esperadas pelo Microsoft Graph.
+# Helpers de URL usados para validar entradas e montar rotas especiais do Graph.
 from core.urls import (
     build_create_content_url,
     build_drive_create_content_url,
@@ -93,11 +90,10 @@ from core.urls import (
     validate_graph_url,
 )
 
-# Builders montam bodies do SDK sem expor essa montagem para o servico.
+# Builders montam staging e bodies do SDK sem expor essa montagem ao servico.
 from core.builders import build_folder_drive_item, build_upload_content
 
-# O servico de SharePoint orquestra as operacoes de leitura e escrita em cima do
-# cliente autenticado do Graph.
+# O servico concentra as regras de navegacao, criacao e upload sobre o client.
 from core.sharepoint import SharePointService
 
 from core.utils import rename_with_uuid

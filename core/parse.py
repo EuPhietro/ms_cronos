@@ -143,8 +143,8 @@ def parse_local_file(path: Path | str) -> LocalFile:
     Diferente de `LocalFile.from_path`, este parser valida que o caminho existe e
     aponta para arquivo antes de devolver o model interno.
     """
-    # Este parser adapta um caminho local para o modelo interno que depois pode
-    # ser usado por upload e validacoes de arquivo.
+    # Diferente do construtor permissivo do model, este parser garante que o
+    # caminho realmente representa um arquivo legivel para o Core.
     path = Path(path)
     
     if not path.is_file():
@@ -202,8 +202,8 @@ def parse_drive_item_collection_response(
     aceitar pastas vazias como retorno valido, este e o ponto que deve materializar
     `DriveItemCollection` vazia em vez de erro.
     """
-    # Itens de drive podem ser arquivos ou pastas, entao a adaptacao de cada
-    # elemento preserva essas duas informacoes no modelo interno.
+    # Itens de drive podem ser arquivos ou pastas; a adaptacao de cada elemento
+    # preserva essa distincao no modelo interno.
     if not drive_item_collection_response.value:
        return DriveItemCollection()
 
@@ -225,8 +225,8 @@ def parse_o_data_error(
     casos de recurso ausente, refina a classe final usando o contexto da
     operacao que falhou.
     """
-    # A estrutura tipica do SDK e `ODataError.error.code/message`. Quando essa
-    # estrutura nao vem preenchida, o parser recorre a `primary_message`.
+    # O parser tenta primeiro a estrutura completa `error.code/message` do SDK.
+    # Se ela vier vazia, usa `primary_message` como fallback humano minimo.
     error = o_data_error.error
     code = (error.code or "").strip() if error else ""
     normalized_code = code.casefold()

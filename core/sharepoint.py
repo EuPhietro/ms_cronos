@@ -67,13 +67,14 @@ class SharePointService:
     '''
 
     def __init__(self, graph_client_manager: GraphClientManager) -> None:
-        # O servico recebe o manager pronto para manter autenticacao e criacao
-        # do SDK fora da camada de negocio do SharePoint.
+        # O manager encapsula autenticacao e ciclo de vida do client Graph,
+        # deixando o servico focado apenas em regras de SharePoint.
         self._client_manager = graph_client_manager
 
     async def resolve_site(
-            self,
-            sharepoint_url: str) -> SiteRef:
+        self,
+        sharepoint_url: str,
+    ) -> SiteRef:
         '''Resolve uma URL humana do SharePoint e devolve um `SiteRef`.
 
         A rota `sites.with_url(...)` pode retornar dados em formatos diferentes
@@ -81,14 +82,16 @@ class SharePointService:
         quanto `response.additional_data`.
         '''
         try:
-            # 1. Converte a URL humana do SharePoint na rota de resolucao do
-            #    Graph que aceita hostname + path.
+            # A URL humana e convertida para a rota Graph que entende
+            # `hostname:/server-relative-path`.
             secure_url = build_graph_site_url(sharepoint_url)
 
-            # 2. Consulta o Graph para descobrir o site correspondente.
+            # A rota `sites.with_url(...)` resolve o site sem exigir que o
+            # chamador conheca o `site_id` antes.
             response = await self._client_manager.client.sites.with_url(secure_url).get()
-
-            # 3. Falha cedo se o SDK nao devolver nenhum envelope de resposta.
+            
+            # Sem envelope, o Core nao consegue distinguir site inexistente de
+            # resposta remota inconsistente.
             if not response:
                 raise SiteResolutionError(
                     f'Nao foi possivel obter resposta do Graph ao resolver o site: {sharepoint_url}'
@@ -98,12 +101,12 @@ class SharePointService:
             #    cenarios o site resolvido vem em `response.value[0]`; em outros,
             #    os dados minimos chegam em `response.additional_data`.
             if response.value:
-                # 4.1. Quando o envelope vier preenchido com `value`, o fluxo
-                #      segue pelo parser padrao de `Site`.
+                # Quando o SDK preenche `value`, a adaptacao segue o parser
+                # normal de `Site`.
                 data = parse_site(response.value[0])
             elif response.additional_data.get('id'):
-                # 4.2. Fallback especifico para a rota `sites.with_url(...)`,
-                #      onde o SDK pode popular apenas `additional_data`.
+                # Alguns cenarios populam apenas `additional_data`; neste caso o
+                # Core faz um fallback controlado para nao perder a resolucao.
                 data = adapt_site(response.additional_data)
             else:
                 raise GraphResponseError(
@@ -123,13 +126,15 @@ class SharePointService:
             # interna do Core.
             raise parse_o_data_error(error, operation='resolve_site')
         else:
-            # 5. So depois das validacoes o model cru do SDK e convertido para o
-            #    contrato interno enxuto do Core.
+            # O retorno final expoe apenas a referencia semantica do Core.
             return data
 
+
+
     async def list_site_drives(
-            self,
-            site_ref: SiteRef) -> DriveRefCollection:
+        self,
+        site_ref: SiteRef,
+    ) -> DriveRefCollection:
         '''Lista as bibliotecas de documentos associadas a um site resolvido.'''
         try:
             # 1. Parte de um site ja resolvido e usa apenas o `site_ref.id` para
@@ -162,8 +167,9 @@ class SharePointService:
             return parse_drive_collection_response(response)
 
     async def get_default_drive(
-            self,
-            site_ref: SiteRef) -> DriveRef:
+        self,
+        site_ref: SiteRef,
+    ) -> DriveRef:
         '''Obtem o drive padrao do site a partir de um `SiteRef` ja resolvido.'''
 
         try:
@@ -188,8 +194,9 @@ class SharePointService:
             return parse_drive(response)
 
     async def get_drive(
-            self,
-            drive_ref: DriveRef) -> DriveRef:
+        self,
+        drive_ref: DriveRef,
+    ) -> DriveRef:
         '''Reconsulta um drive especifico a partir de um `DriveRef`.
 
         Use quando voce ja tem um id de drive e quer confirmar ou atualizar os
@@ -219,8 +226,9 @@ class SharePointService:
             return parse_drive(response)
 
     async def get_drive_root(
-            self,
-            drive_ref: DriveRef) -> DriveItemRef:
+        self,
+        drive_ref: DriveRef,
+    ) -> DriveItemRef:
         '''Retorna o `DriveItemRef` que representa a raiz do drive.'''
         try:
             # 1. Consulta o item raiz do drive, que no Graph e modelado como um
@@ -247,9 +255,10 @@ class SharePointService:
             return parse_drive_item(site_response)
 
     async def list_children(
-            self,
-            drive_ref: DriveRef,
-            parent_item_ref: DriveItemRef) -> DriveItemCollection:
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+    ) -> DriveItemCollection:
         '''Lista os filhos imediatos de uma pasta remota.
 
         A busca nao e recursiva: cada chamada representa exatamente um nivel da
@@ -291,12 +300,12 @@ class SharePointService:
             return parse_drive_item_collection_response(response)
 
     async def find_child_by_name(
-            self,
-            drive_ref: DriveRef,
-            parent_item_ref: DriveItemRef,
-            name: str) -> Optional[DriveItemRef]:
-        '''
-        Busca um filho imediato pelo nome dentro de uma pasta remota.'''
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        name: str,
+    ) -> Optional[DriveItemRef]:
+        '''Busca um filho imediato pelo nome dentro de uma pasta remota.'''
         try:
             # Reaproveita `list_children` para manter uma unica rota de
             # navegacao remota.
@@ -322,10 +331,11 @@ class SharePointService:
             raise parse_o_data_error(error, operation='list_children')
 
     async def find_child_by_id(
-            self,
-            drive_ref: DriveRef,
-            parent_item_ref: DriveItemRef,
-            drive_id: str) -> Optional[DriveItemRef]:
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        drive_id: str,
+    ) -> Optional[DriveItemRef]:
         '''Busca um filho imediato pelo id dentro de uma pasta remota.'''
         try:
             # Reaproveita `list_children` para manter uma unica rota de
@@ -351,10 +361,11 @@ class SharePointService:
             raise parse_o_data_error(error, operation='list_children')
 
     async def find_child_by_web_url(
-            self,
-            drive_ref: DriveRef,
-            parent_item_ref: DriveItemRef,
-            web_url: str) -> Optional[DriveItemRef]:
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        web_url: str,
+    ) -> Optional[DriveItemRef]:
         '''Busca um filho imediato pela URL web dentro de uma pasta remota.'''
         try:
             # Reaproveita `list_children` para manter uma unica rota de
@@ -380,10 +391,11 @@ class SharePointService:
             raise parse_o_data_error(error, operation='list_children')
 
     async def find_child_folder(
-            self,
-            drive_ref: DriveRef,
-            parent_item_ref: DriveItemRef,
-            name: str) -> Optional[DriveItemRef]:
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        name: str,
+    ) -> Optional[DriveItemRef]:
         '''Busca uma pasta filha imediata pelo nome.'''
         try:
             # A busca de pasta parte da mesma listagem imediata usada pelos
@@ -418,10 +430,11 @@ class SharePointService:
             raise parse_o_data_error(error, operation='find_child_folder')
 
     async def find_child_file(
-            self,
-            drive_ref: DriveRef,
-            parent_item_ref: DriveItemRef,
-            name: str) -> Optional[DriveItemRef]:
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        name: str,
+    ) -> Optional[DriveItemRef]:
         '''Busca um arquivo filho imediato pelo nome.'''
         try:
             # A busca de arquivo reaproveita a mesma listagem imediata usada
@@ -456,9 +469,11 @@ class SharePointService:
             raise parse_o_data_error(error, operation='find_child_file')
 
     async def find_child_folder_by_id(
-            self, drive_ref: DriveRef,
-            parent_item_ref: DriveItemRef,
-            drive_id: str) -> Optional[DriveItemRef]:
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        drive_id: str,
+    ) -> Optional[DriveItemRef]:
         '''Busca uma pasta filha imediata pelo id do DriveItem.'''
         try:
             # Reaproveita a listagem imediata do pai; ids de DriveItem sao
@@ -497,10 +512,11 @@ class SharePointService:
             raise parse_o_data_error(error, operation='find_child_folder')
 
     async def find_child_folder_web_url(
-            self,
-            drive_ref: DriveRef,
-            parent_item_ref: DriveItemRef,
-            web_url: str) -> Optional[DriveItemRef]:
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        web_url: str,
+    ) -> Optional[DriveItemRef]:
         '''Busca uma pasta filha imediata pela URL web do DriveItem.'''
         try:
             # A URL web e comparada apenas entre os filhos imediatos do item pai.
@@ -644,7 +660,7 @@ class SharePointService:
         parent_item_ref: DriveItemRef,
         local_file: LocalFile,
         conflict_behavior: Literal["fail", "rename", "replace"] = 'fail',
-    ) -> UploadResult:
+        ) -> UploadResult:
         """Envia um arquivo pequeno por PUT direto no endpoint `/content`.
 
         O fluxo decide entre criar ou substituir de acordo com a existencia do
@@ -669,6 +685,8 @@ class SharePointService:
             )
 
         try:
+            # O fluxo pequeno trabalha com o arquivo inteiro em memoria, entao a
+            # leitura local precisa acontecer antes do `PUT`.
             content_bytes = local_file.path.read_bytes()
         except OSError as error:
             raise LocalFileNotReadableError(
@@ -676,6 +694,8 @@ class SharePointService:
             ) from error
 
         try:
+            # O staging concentra o nome remoto final e o fragmento de rota
+            # usado na criacao por nome.
             staging_content: StagingContentUpload = build_upload_content(
                 local_file,
                 None,
@@ -691,6 +711,8 @@ class SharePointService:
             remote_name = local_file.name
 
             if existing_file is None:
+                # Sem conflito remoto, o upload pequeno cria o arquivo usando a
+                # rota `items/{parent-id}:/{filename}:/content`.
                 create_url = build_drive_create_content_url(
                     drive_ref.id,
                     parent_item_ref.id,
@@ -708,6 +730,8 @@ class SharePointService:
                     f'Ja existe um arquivo chamado {local_file.name} na pasta remota {parent_item_ref.id}.'
                 )
             elif staging_content.conflict_behavior == 'rename':
+                # Em modo `rename`, o Core gera um novo nome remoto e tenta a
+                # criacao novamente sob o mesmo pai.
                 remote_name = rename_with_uuid(local_file.name)
                 staging_content = build_upload_content(
                     local_file.rename(remote_name),
@@ -727,6 +751,8 @@ class SharePointService:
                     .put(content_bytes)
                 )
             else:
+                # Em modo `replace`, o upload usa diretamente o `item_id` do
+                # arquivo existente e substitui apenas o conteudo.
                 response = await (
                     self._client_manager.client.drives
                     .by_drive_id(drive_ref.id)
@@ -740,6 +766,8 @@ class SharePointService:
                     f'O Graph nao retornou um DriveItem apos o upload pequeno de {local_file.path}.'
                 )
 
+            # O retorno do SDK ainda e um `DriveItem`; o parser o reduz para a
+            # referencia semantica usada pelo restante do Core.
             uploaded_item = parse_drive_item(response)
             return UploadResult(
                 item=uploaded_item,

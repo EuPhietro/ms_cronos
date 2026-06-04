@@ -1,4 +1,3 @@
-
 """Hierarquia de erros semanticos do Core.
 
 As camadas superiores devem capturar erros deste modulo, nao erros crus do SDK
@@ -210,6 +209,8 @@ class FileAlreadyExistError(MSCronosError):
 
     def __init__(self, *args) -> None:
         super().__init__(*args)
+
+
 # ---- ERROS DE REQUISICAO GRAPH ----
 
 
@@ -268,6 +269,11 @@ class GraphResponseError(GraphRequestError):
 # ---- ERROS DE CRIAÇÃO DE RECURSOS ----
 
 class FailedWhenCreateDriveItemError(MSCronosError):
+    '''
+    Use quando a operacao de criacao nao devolver um `DriveItem` valido para o
+    Core seguir com parse e navegacao.
+    '''
+
     def __init__(self, *args) -> None:
         super().__init__(*args)
 
