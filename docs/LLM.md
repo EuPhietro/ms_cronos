@@ -1,45 +1,40 @@
 # LLM Repository Guide
 
-Este documento existe para acelerar a leitura automatica do repositorio por
-LLMs, agentes e assistentes de codigo.
+Este documento existe para acelerar a leitura do repositorio por LLMs, agentes
+e assistentes de codigo.
 
-## Projeto
+## Resumo Curto
 
-Nome: `MS Cronos`
+- linguagem principal: Python;
+- dominio atual: SharePoint + Microsoft Graph;
+- camada principal implementada: `core/`;
+- objetivo atual: navegar por sites e drives, criar pastas remotas e enviar
+  arquivos pequenos;
+- objetivo futuro: upload de diretorios locais complexos.
 
-Objetivo principal:
-automatizar navegacao e upload de conteudo local para bibliotecas de documentos
-do SharePoint via Microsoft Graph.
+## O Que Ja Existe
 
-Objetivo de medio prazo do Core:
-permitir upload de diretorios locais complexos preservando a estrutura remota,
-sem expor a verbosidade do SDK oficial para o restante do sistema.
+O Core ja implementa:
 
-## Estado Atual
-
-O repositorio esta concentrado na camada `core/`.
-
-Ja existe implementacao funcional para:
-
-- autenticacao com Microsoft Graph;
-- resolucao de site SharePoint por URL humana;
-- listagem de drives de um site;
+- autenticacao Graph;
+- resolucao de site por URL humana;
+- listagem de drives;
 - obtencao do drive padrao;
 - obtencao da raiz do drive;
-- listagem de filhos de uma pasta remota;
-- busca imediata de filhos por nome, id e `web_url`;
-- criacao de pastas remotas;
-- garantia de caminho remoto com criacao incremental;
-- upload de arquivos pequenos;
+- listagem de filhos imediatos;
+- busca de filhos por nome, id e `web_url`;
+- busca tipada de pasta e arquivo;
+- criacao de pasta remota;
+- garantia de caminho remoto;
+- upload pequeno com conflito `fail`, `rename` ou `replace`;
 - parse de models do SDK para models internos;
-- traducao inicial de `ODataError` para erros semanticos do Core.
+- traducao inicial de `ODataError`.
 
-Ainda faltam, em especial:
+Ainda faltam:
 
-- upload de arquivos grandes com upload session;
-- leitura e mapeamento de arvores locais;
-- upload completo de diretorios locais complexos;
-- consolidacao final dos fluxos de navegacao e sincronizacao.
+- upload grande por upload session;
+- leitura recursiva de arvore local;
+- upload completo de diretorios.
 
 ## Estrutura Relevante
 
@@ -65,8 +60,6 @@ ms_cronos/
 
 ## Ordem Recomendada de Leitura
 
-Para entender o repositorio rapidamente:
-
 1. `README.md`
 2. `docs/SPEC.md`
 3. `core/__init__.py`
@@ -80,7 +73,7 @@ Para entender o repositorio rapidamente:
 
 ## Mapa Conceitual
 
-Hierarquia remota importante no SharePoint/Graph:
+Hierarquia remota relevante:
 
 ```text
 Tenant
@@ -91,10 +84,10 @@ Tenant
      -> File
 ```
 
-Leitura equivalente dentro do Core:
+Mapeamento para contratos internos:
 
 ```text
-sharepoint human url
+SharePoint URL
   -> SiteRef
   -> DriveRef
   -> DriveItemRef
@@ -102,21 +95,18 @@ sharepoint human url
 
 ## Filosofia do Core
 
-O Core tenta manter quatro regras:
+Ao mexer no projeto, preserve estas regras:
 
 1. expor contratos pequenos e semanticos;
 2. nao vazar envelopes crus do SDK para fora do Core;
-3. centralizar parse e traducao de erros;
-4. deixar `sharepoint.py` como servico de orquestracao, nao como deposito de
-   estruturas cruas do Graph.
+3. centralizar parse e traducao de erros em `core.parse`;
+4. deixar `core.sharepoint` como orquestrador, nao como model paralelo do SDK.
 
-## Modulos do Core
+## Modulos e Responsabilidades
 
 ### `core/models.py`
 
-Define os contratos internos do projeto.
-
-Itens mais importantes:
+Contem:
 
 - `GraphCredentials`
 - `SiteRef`
@@ -125,225 +115,193 @@ Itens mais importantes:
 - `LocalFile`
 - `StagingContentUpload`
 - `UploadResult`
+- colecoes genericas e colecoes concretas
 
-Tambem define a familia de colecoes:
+Use este modulo quando a tarefa envolver:
 
-- `Collection_[T]`
-- `FrozenCollection[T]`
-- `MutableCollection[T]`
-- `SiteRefCollection`
-- `DriveRefCollection`
-- `DriveItemCollection`
-- `LocalFileCollection`
-- `StagingUpdateContentCollection`
-
-Observacao:
-as colecoes sao parte importante do design semantico do projeto. O repositorio
-evita retornar listas cruas quando existe uma colecao concreta mais expressiva.
+- novo model interno;
+- colecao semantica;
+- contrato de retorno do Core.
 
 ### `core/errors.py`
 
 Contem a hierarquia semantica de erros do projeto.
 
-Intencao:
-quem consome o Core deve lidar com erros do dominio interno, e nao com
-excecoes cruas do SDK do Microsoft Graph.
+Use este modulo quando a tarefa envolver:
 
-Exemplos importantes:
+- novo erro de dominio;
+- refinamento de mensagens de erro;
+- mapeamento de falhas do Graph para erros internos.
+
+### `core/graph_client.py`
+
+Contem o manager do Graph.
+
+Use este modulo quando a tarefa envolver:
+
+- credenciais;
+- scopes;
+- criacao ou fechamento do `GraphServiceClient`.
+
+### `core/parse.py`
+
+Contem adaptadores entre SDK e Core.
+
+Use este modulo quando a tarefa envolver:
+
+- parse de `Site`, `Drive` ou `DriveItem`;
+- parse de collection responses;
+- parse de `ODataError`;
+- parse de caminho local para `LocalFile`.
+
+### `core/urls.py`
+
+Contem helpers de URL e rotas Graph.
+
+Use este modulo quando a tarefa envolver:
+
+- validacao de URL do SharePoint;
+- montagem de URL de resolucao;
+- montagem de fragmento ou URL de upload pequeno.
+
+### `core/builders.py`
+
+Contem builders de payload e staging.
+
+Use este modulo quando a tarefa envolver:
+
+- body para criacao de pasta;
+- staging de upload pequeno;
+- validacao de `conflict_behavior`;
+- validacao de nome remoto.
+
+### `core/sharepoint.py`
+
+Contem o servico principal.
+
+Use este modulo quando a tarefa envolver:
+
+- navegacao remota;
+- criacao de pasta;
+- upload pequeno;
+- fluxo de negocio sobre site, drive e item.
+
+### `core/utils.py`
+
+Contem helpers pequenos e reutilizaveis.
+
+Hoje o destaque e:
+
+- `rename_with_uuid(...)`
+
+## API Atual Mais Importante
+
+O `SharePointService` hoje expoe principalmente:
+
+- `resolve_site(...)`
+- `list_site_drives(...)`
+- `get_default_drive(...)`
+- `get_drive(...)`
+- `get_drive_root(...)`
+- `list_children(...)`
+- `find_child_by_name(...)`
+- `find_child_by_id(...)`
+- `find_child_by_web_url(...)`
+- `find_child_folder(...)`
+- `find_child_file(...)`
+- `find_child_folder_by_id(...)`
+- `find_child_folder_web_url(...)`
+- `create_folder(...)`
+- `ensure_remote_folder_path(...)`
+- `upload_small_file(...)`
+
+## Exemplo Minimo
+
+```python
+import asyncio
+from os import getenv
+
+from core import GraphClientManager, GraphCredentials, LocalFile, SharePointService
+
+
+async def main() -> None:
+    credentials = GraphCredentials(
+        client_id=getenv("CLIENT_ID", ""),
+        client_secret=getenv("CLIENT_SECRET", ""),
+        tenant_id=getenv("CLIENT_TENANT", ""),
+    )
+
+    async with GraphClientManager(credentials) as manager:
+        sharepoint = SharePointService(manager)
+
+        site = await sharepoint.resolve_site(
+            "https://tenant.sharepoint.com/sites/RHConecta"
+        )
+        drive = await sharepoint.get_default_drive(site)
+        root = await sharepoint.get_drive_root(drive)
+
+        target = await sharepoint.ensure_remote_folder_path(
+            drive,
+            root,
+            ("datasets", "2026", "06"),
+        )
+
+        local_file = LocalFile.from_path("/tmp/relatorio.csv")
+        result = await sharepoint.upload_small_file(
+            drive,
+            target,
+            local_file,
+            conflict_behavior="rename",
+        )
+
+        print(result.remote_name)
+
+
+asyncio.run(main())
+```
+
+## Regras Operacionais Importantes
+
+### Navegacao
+
+- `list_children(...)` nao e recursivo;
+- buscas operam sobre filhos imediatos;
+- um `drive_item_id` identifica o item dentro do drive informado.
+
+### Upload pequeno
+
+- limite atual: `250_000_000` bytes;
+- `fail` levanta erro se o nome remoto ja existir;
+- `rename` gera novo nome preservando extensao;
+- `replace` substitui o conteudo do arquivo existente.
+
+### Erros
+
+O Core prefere levantar erros internos, por exemplo:
 
 - `SiteResolutionError`
 - `DriveNotFoundError`
 - `DriveItemNotFoundError`
-- `FolderNotFoundError`
 - `NotAFolderError`
 - `NotAFileError`
 - `FileAlreadyExistError`
 - `FileVeryLargeError`
 - `SmallFileUploadError`
-- `LargeFileUploadError`
 
-### `core/graph_client.py`
+## Heuristicas Para Novas Tarefas
 
-Responsavel por:
+Se a tarefa mencionar:
 
-- validar credenciais;
-- criar o `GraphServiceClient`;
-- encapsular o ciclo de vida do `ClientSecretCredential`.
-
-### `core/parse.py`
-
-Responsavel por adaptar dados externos para contratos internos.
-
-Principais grupos de funcoes:
-
-- parse de `Site`, `Drive` e `DriveItem`;
-- parse de collection responses do SDK;
-- parse de caminho local para `LocalFile`;
-- parse de `ODataError` para erros internos.
-
-Regra importante:
-se um dado veio do SDK e precisa sair do Core, o caminho preferido e passar por
-`parse.py`.
-
-### `core/urls.py`
-
-Responsavel por:
-
-- validar URL humana do SharePoint;
-- montar a URL especial de resolucao de site para o Graph;
-- montar fragmentos e URLs de upload de conteudo.
-
-### `core/builders.py`
-
-Responsavel por construir payloads e staging objects usados pelo servico.
-
-Pontos importantes:
-
-- `build_folder_drive_item(...)`
-- `build_upload_content(...)`
-
-O builder de upload pequeno prepara:
-
-- `target_path`
-- `conflict_behavior`
-- validacao de nome remoto
-
-### `core/sharepoint.py`
-
-Servico principal do Core.
-
-Ele orquestra chamadas ao Graph e retorna apenas modelos internos.
-
-Metodos importantes ja implementados:
-
-- `resolve_site`
-- `list_site_drives`
-- `get_default_drive`
-- `get_drive`
-- `get_drive_root`
-- `list_children`
-- `find_child_by_name`
-- `find_child_by_id`
-- `find_child_by_web_url`
-- `find_child_folder`
-- `find_child_file`
-- `create_folder`
-- `ensure_remote_folder_path`
-- `upload_small_file`
-
-### `core/utils.py`
-
-Helpers pequenos e reutilizaveis.
-
-Hoje o principal exemplo e:
-
-- `rename_with_uuid(...)`
-
-Esse helper preserva extensao ao gerar um nome alternativo.
-
-## API Publica
-
-Quando outro modulo do projeto quiser consumir o Core, a preferencia e importar
-de `core.__init__`, nao de submodulos internos, salvo quando estiver
-implementando o proprio Core.
-
-Exemplo:
-
-```python
-from core import GraphClientManager, GraphCredentials, SharePointService
-```
-
-## Fluxo Feliz Atual
-
-O fluxo funcional atual e aproximadamente:
-
-```text
-GraphCredentials
-  -> GraphClientManager
-  -> SharePointService
-  -> resolve_site(url)
-  -> get_default_drive(site)
-  -> get_drive_root(drive)
-  -> list_children(drive, root)
-  -> ensure_remote_folder_path(...)
-  -> upload_small_file(...)
-```
-
-## Regras e Convencoes Importantes
-
-### 1. Parse centralizado
-
-Evite adaptar manualmente `Site`, `Drive` e `DriveItem` dentro de
-`sharepoint.py` quando um parser do modulo `parse.py` puder ser usado.
-
-### 2. Erros semanticos
-
-Se uma operacao falha por regra de negocio, o retorno esperado e um erro do
-Core, nao uma excecao generica.
-
-### 3. IDs do Graph
-
-Para navegar entre niveis remotos, geralmente nao e necessario concatenar ids
-ancestrais na URL. Um `drive_id` identifica o drive e um `drive_item_id`
-identifica o item dentro daquele drive.
-
-### 4. Small upload
-
-O fluxo atual de upload pequeno trata conflitos via `conflict_behavior`.
-
-Valores aceitos:
-
-- `fail`
-- `rename`
-- `replace`
-
-### 5. Limite atual para arquivo pequeno
-
-O Core hoje considera arquivo grande acima de `250_000_000` bytes para o fluxo
-de upload pequeno.
-
-### 6. `main.py` nao e API
-
-`main.py` funciona como laboratorio manual e roteiro de validacao local.
-Ele nao representa a interface publica final do projeto.
-
-## Ponto de Entrada Mental para Novas Implementacoes
-
-Se a tarefa for:
-
-- modelagem de dados: comece por `core/models.py`;
-- traducao de SDK para Core: comece por `core/parse.py`;
-- montagem de payload ou staging: comece por `core/builders.py`;
-- navegacao, criacao ou upload remoto: comece por `core/sharepoint.py`;
-- construcao de URLs do Graph: comece por `core/urls.py`;
-- novo erro de dominio: comece por `core/errors.py`.
-
-## Lacunas Conhecidas
-
-As areas que ainda devem evoluir com mais cuidado sao:
-
-- upload grande em partes;
-- politica completa de conflitos para todas as operacoes;
-- leitura de diretorios locais e representacao de arvore;
-- consolidacao do fluxo de upload de diretorios inteiros;
-- possiveis refinamentos de comentarios, mensagens e assinaturas.
-
-## Exemplo de Leitura Rapida por LLM
-
-Se um agente precisar responder rapidamente "onde implementar X?", use estas
-heuristicas:
-
-- "novo model interno" -> `core/models.py`
+- "novo model" -> `core/models.py`
 - "novo parse do SDK" -> `core/parse.py`
-- "novo erro semantico" -> `core/errors.py`
-- "nova URL ou fragmento Graph" -> `core/urls.py`
-- "novo payload/body de envio" -> `core/builders.py`
+- "nova URL Graph" -> `core/urls.py`
+- "novo body de envio" -> `core/builders.py`
 - "nova operacao SharePoint" -> `core/sharepoint.py`
-- "exemplo manual de uso" -> `main.py`
+- "novo erro" -> `core/errors.py`
 
 ## Arquivos Fonte de Verdade
 
-Para contexto humano e de produto:
+Para contexto humano:
 
 - `README.md`
 - `docs/SPEC.md`
