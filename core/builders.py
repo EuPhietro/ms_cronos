@@ -6,18 +6,15 @@ Este modulo nao executa chamadas remotas. Ele apenas:
 - prepara o staging interno usado pelo fluxo de upload pequeno.
 """
 
-from typing import Literal, Optional
-
 from msgraph.generated.models.drive_item import DriveItem
 from msgraph.generated.models.folder import Folder
 
 from core.errors import InvalidConflictBehaviorError, InvalidRemoteNameError
-from core.models import LocalFile, StagingContentUpload
+from core.models import ConflictBehavior, LocalFile, PreparedUpload
 from core.urls import build_create_content_url
 
-
-ConflictBehavior = Literal["fail", "rename", "replace"]
 ALLOWED_CONFLICT_BEHAVIORS: set[str] = {"fail", "rename", "replace"}
+
 
 def _normalize_remote_name(name: str) -> str:
     """Normaliza e valida um nome remoto simples de arquivo ou pasta."""
@@ -32,25 +29,25 @@ def _normalize_remote_name(name: str) -> str:
 
 
 def _normalize_conflict_behavior(
-    conflict_behavior: ConflictBehavior | str,
+    conflict_behavior: str,
 ) -> ConflictBehavior:
     """Normaliza e valida a estrategia de conflito usada pelo Core."""
     normalized_conflict_behavior = conflict_behavior.strip().casefold()
     if normalized_conflict_behavior not in ALLOWED_CONFLICT_BEHAVIORS:
         raise InvalidConflictBehaviorError(
-            "Conflict behavior invalido. Use um destes valores: fail, rename ou replace."
+            "Conflict behavior invalido. Use: fail, rename ou replace."
         )
     return normalized_conflict_behavior  # type: ignore[return-value]
 
 
 def build_folder_drive_item(
     name: str,
-    conflict_behavior: ConflictBehavior | str = "fail",
+    conflict_behavior: ConflictBehavior = "fail",
 ) -> DriveItem:
     """Monta o body `DriveItem` usado pelo Graph para criar uma pasta.
 
-    O Graph espera um `DriveItem` com `name`, a facet `folder` e o valor especial
-    `@microsoft.graph.conflictBehavior` em `additional_data`.
+    O Graph espera um `DriveItem` com `name`, a facet `folder` e o valor
+    especial `@microsoft.graph.conflictBehavior` em `additional_data`.
     """
     # Pastas remotas sao criadas por body JSON, entao o builder entrega o model
     # do SDK pronto para `children.post(...)`.
@@ -58,27 +55,30 @@ def build_folder_drive_item(
     normalized_conflict_behavior = _normalize_conflict_behavior(conflict_behavior)
 
     body = DriveItem(name=folder_name, folder=Folder())
-    body.additional_data["@microsoft.graph.conflictBehavior"] = normalized_conflict_behavior
+    body.additional_data["@microsoft.graph.conflictBehavior"] = (
+        normalized_conflict_behavior
+    )
     return body
 
+
 def build_upload_content(
-    file: LocalFile,
-    remote_name: Optional[str],
-    conflict_behavior: ConflictBehavior | str = "fail",
-) -> StagingContentUpload:
+    local_file: LocalFile,
+    remote_name: str | None = None,
+    conflict_behavior: ConflictBehavior = "fail",
+) -> PreparedUpload:
     """Monta o staging semantico usado pelo upload pequeno do Core.
 
     O staging nao guarda a URL Graph completa. Ele armazena apenas o fragmento
     de caminho que identifica o recurso de criacao por nome, por exemplo
     `:/curriculo.pdf:/content`.
     """
-    # O nome remoto pode ser sobrescrito pelo chamador ou reaproveitar o nome do
-    # arquivo local quando o upload mantiver a identidade original.
-    remote_file_name = _normalize_remote_name(remote_name or file.name)
+    # O nome remoto pode ser sobrescrito pelo chamador ou reaproveitar o nome
+    # do arquivo local quando o upload mantiver a identidade original.
+    remote_file_name = _normalize_remote_name(remote_name or local_file.name)
     normalized_conflict_behavior = _normalize_conflict_behavior(conflict_behavior)
 
-    return StagingContentUpload(
-        file=file,
+    return PreparedUpload(
+        file=local_file,
         target_path=build_create_content_url(remote_file_name),
         conflict_behavior=normalized_conflict_behavior,
     )

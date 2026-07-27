@@ -1,8 +1,8 @@
-'''Servico de alto nivel para operacoes do SharePoint via Microsoft Graph.
+"""Servico de alto nivel para operacoes do SharePoint via Microsoft Graph.
 
-Este modulo concentra a adaptacao entre o SDK do Graph e os contratos semanticos
-do Core. O objetivo e expor operacoes pequenas, previsiveis e tipadas, sem
-vazar envelopes crus do SDK para as camadas superiores.
+Este modulo adapta o SDK do Graph aos contratos semanticos do Core. O objetivo
+e expor operacoes pequenas e previsiveis para navegacao, criacao de pastas e
+upload de arquivos pequenos ou grandes.
 
 Exemplo de uso:
     service = SharePointService(graph_client_manager)
@@ -10,77 +10,156 @@ Exemplo de uso:
     drive = await service.get_default_drive(site)
     root = await service.get_drive_root(drive)
     children = await service.list_children(drive, root)
-'''
+"""
 
 from __future__ import annotations
 
-from typing import Literal, Optional, Sequence
+from collections.abc import Sequence
 
+from msgraph.generated.drives.item.items.item.create_upload_session.create_upload_session_post_request_body import (
+    CreateUploadSessionPostRequestBody,
+)
+from msgraph.generated.models.drive import Drive
+from msgraph.generated.models.drive_collection_response import DriveCollectionResponse
+from msgraph.generated.models.drive_item import DriveItem
+from msgraph.generated.models.drive_item_uploadable_properties import (
+    DriveItemUploadableProperties,
+)
 from msgraph.generated.models.o_data_errors.o_data_error import ODataError
+from msgraph.generated.models.upload_session import UploadSession
+from msgraph_core import PageIterator
+from msgraph_core.tasks import LargeFileUploadTask
 
-from core import (
-    adapt_site,
-    build_folder_drive_item,
-    build_drive_create_content_url,
-    build_graph_site_url,
+from core.builders import build_folder_drive_item, build_upload_content
+from core.errors import (
     DefaultDriveNotFoundError,
-    DriveItemCollection,
     DriveItemNotFoundError,
-    DriveItemRef,
+    DriveNotFoundError,
+    FailedWhenCreateDriveItemError,
+    FileAlreadyExistError,
+    FileVeryLargeError,
+    GraphResponseError,
+    InvalidConflictBehaviorError,
+    InvalidRemoteNameError,
+    LocalFileNotReadableError,
+    LocalPathIsDirectoryError,
+    LocalPathNotFoundError,
+    NotAFileError,
+    NotAFolderError,
+    SiteResolutionError,
+    SmallFileUploadError,
+    UploadError,
+)
+from core.graph_client import GraphClientManager
+from core.models import (
+    ConflictBehavior,
+    DocumentLibrary,
+    DocumentLibraryCollection,
+    FileUploadResult,
+    LocalFile,
+    PreparedUpload,
+    SharePointItem,
+    SharePointItemCollection,
+    SharePointSite,
+)
+from core.parse import (
+    adapt_site,
     parse_drive,
     parse_drive_collection_response,
     parse_drive_item,
     parse_drive_item_collection_response,
     parse_o_data_error,
-    DriveRef,
-    DriveRefCollection,
-    FailedWhenCreateDriveItemError,
-    GraphClientManager,
-    GraphResponseError,
-    DriveNotFoundError,
-    InvalidConflictBehaviorError,
-    InvalidRemoteNameError,
-    NotAFolderError,
     parse_site,
-    SiteRef,
-    SiteResolutionError,
 )
-from core.builders import build_upload_content
-from core.errors import (
-    FileAlreadyExistError,
-    FileVeryLargeError,
-    LocalFileNotReadableError,
-    LocalPathIsDirectoryError,
-    LocalPathNotFoundError,
-    NotAFileError,
-    SmallFileUploadError,
+from core.urls import (
+    build_drive_create_content_url,
+    build_graph_site_url,
 )
-from core.models import LocalFile, StagingContentUpload, UploadResult
 from core.utils import rename_with_uuid
+
+# Tamanho maximo entregue ao `LargeFileUploadTask` em cada envio parcial.
+MAX_CHUNK_SIZE = 60 * 1024 * 1024
+
+MAX_SMALL_FILE_SIZE = 250_000_000  # 250 milhões de bytes
 
 
 class SharePointService:
-    '''Servico principal do Core para leitura de sites, drives e itens.
+    """Orquestra operacoes semanticas do SharePoint sobre o Microsoft Graph.
 
-    A classe orquestra chamadas ao SDK, valida envelopes minimos e delega a
-    conversao dos models crus ao modulo `parse`.
-    '''
+    O servico funciona como fronteira entre a aplicacao e o SDK. Ele recebe
+    referencias internas do Core, executa as chamadas remotas, valida as
+    respostas e converte os models do Graph antes de devolve-los ao consumidor.
+    Tipos como ``Site``, ``Drive``, ``DriveItem`` e ``PageResult`` permanecem
+    restritos a implementacao.
+
+    As operacoes publicas estao organizadas por responsabilidade:
+
+    - resolucao de URLs do SharePoint em ``SharePointSite``;
+    - consulta e busca de drives de um site;
+    - navegacao pela raiz e pelos filhos de um drive;
+    - busca de arquivos e pastas remotas;
+    - criacao e garantia de caminhos de pastas;
+    - upload de arquivos pequenos ou grandes.
+
+    Listagens paginadas usam o ``PageIterator`` internamente. A classe controla
+    a conversao de cada pagina para modelos semanticos e nao entrega o iterador
+    do SDK como parte de sua API publica. Erros ``ODataError`` devem ser
+    traduzidos para a hierarquia de erros do Core na fronteira de cada operacao.
+
+    Args:
+        graph_client_manager: Manager autenticado que fornece o
+            ``GraphServiceClient`` e seu ``RequestAdapter``.
+
+    Attributes:
+        _client_manager: Manager usado por todas as requisicoes ao Graph.
+
+    Note:
+        A instancia nao cria nem fecha o manager recebido. O chamador continua
+        responsavel por seu ciclo de vida, preferencialmente com ``async with``.
+
+    Example:
+        async with GraphClientManager(credentials) as manager:
+            service = SharePointService(manager)
+            site = await service.resolve_site(sharepoint_url)
+            drive = await service.get_default_drive(site)
+            root = await service.get_drive_root(drive)
+            children = await service.list_children(drive, root)
+    """
 
     def __init__(self, graph_client_manager: GraphClientManager) -> None:
+        """Inicializa o servico com um manager Graph ja configurado.
+
+        Args:
+            graph_client_manager: Manager que fornece o cliente autenticado e
+                o request adapter usado pelas operacoes do servico.
+        """
         # O manager encapsula autenticacao e ciclo de vida do client Graph,
         # deixando o servico focado apenas em regras de SharePoint.
         self._client_manager = graph_client_manager
 
+    # Resolucao de sites
+
     async def resolve_site(
         self,
         sharepoint_url: str,
-    ) -> SiteRef:
-        '''Resolve uma URL humana do SharePoint e devolve um `SiteRef`.
+    ) -> SharePointSite:
+        """Resolve uma URL humana do SharePoint e devolve um `SharePointSite`.
 
         A rota `sites.with_url(...)` pode retornar dados em formatos diferentes
         dependendo do SDK; por isso este metodo aceita tanto `response.value`
         quanto `response.additional_data`.
-        '''
+
+        Args:
+            sharepoint_url: URL humana do site no SharePoint.
+
+        Returns:
+            Referencia semantica do site resolvido.
+
+        Raises:
+            SiteResolutionError: Se o Graph nao devolver uma resposta.
+            GraphResponseError: Se a resposta nao contiver dados suficientes.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
         try:
             # A URL humana e convertida para a rota Graph que entende
             # `hostname:/server-relative-path`.
@@ -88,29 +167,34 @@ class SharePointService:
 
             # A rota `sites.with_url(...)` resolve o site sem exigir que o
             # chamador conheca o `site_id` antes.
-            response = await self._client_manager.client.sites.with_url(secure_url).get()
-            
+            response = await self._client_manager.client.sites.with_url(
+                secure_url
+            ).get()
+
             # Sem envelope, o Core nao consegue distinguir site inexistente de
             # resposta remota inconsistente.
             if not response:
                 raise SiteResolutionError(
-                    f'Nao foi possivel obter resposta do Graph ao resolver o site: {sharepoint_url}'
+                    "Nao foi possivel obter resposta do Graph ao resolver "
+                    f"o site: {sharepoint_url}"
                 )
 
             # 4. A resolucao de site e um caso especial do SDK: em alguns
-            #    cenarios o site resolvido vem em `response.value[0]`; em outros,
-            #    os dados minimos chegam em `response.additional_data`.
+            # cenarios o site resolvido vem em `response.value[0]`; em outros,
+            # os dados minimos chegam em `response.additional_data`.
             if response.value:
                 # Quando o SDK preenche `value`, a adaptacao segue o parser
                 # normal de `Site`.
                 data = parse_site(response.value[0])
-            elif response.additional_data.get('id'):
-                # Alguns cenarios populam apenas `additional_data`; neste caso o
-                # Core faz um fallback controlado para nao perder a resolucao.
+            elif response.additional_data.get("id"):
+                # Alguns cenarios populam apenas `additional_data`; neste caso,
+                # o Core faz um fallback controlado para preservar a resolucao.
                 data = adapt_site(response.additional_data)
             else:
                 raise GraphResponseError(
-                    f'O Graph respondeu a resolucao do site, mas nao retornou dados suficientes para montar um SiteRef: {sharepoint_url}'
+                    "O Graph respondeu a resolucao do site, mas nao retornou "
+                    "dados suficientes para montar um SharePointSite: "
+                    f"{sharepoint_url}"
                 )
 
         except SiteResolutionError:
@@ -124,93 +208,277 @@ class SharePointService:
         except ODataError as error:
             # O parser centraliza a traducao do erro remoto para a hierarquia
             # interna do Core.
-            raise parse_o_data_error(error, operation='resolve_site')
+            raise parse_o_data_error(error, operation="resolve_site")
         else:
             # O retorno final expoe apenas a referencia semantica do Core.
             return data
 
-
+    # Consulta de drives
 
     async def list_site_drives(
         self,
-        site_ref: SiteRef,
-    ) -> DriveRefCollection:
-        '''Lista as bibliotecas de documentos associadas a um site resolvido.'''
-        try:
-            # 1. Parte de um site ja resolvido e usa apenas o `site_ref.id` para
-            #    consultar as bibliotecas/document libraries associadas.
-            response = await self._client_manager.client.sites.by_site_id(site_ref.id).drives.get()
+        site: SharePointSite,
+        *,
+        pagination: bool = True,
+        max_pages: int | None = None,
+    ) -> DocumentLibraryCollection:
+        """Lista os drives associados a um site, com paginacao opcional.
 
-            # 2. Garante que o SDK devolveu o envelope da operacao.
-            if not response:
-                raise DriveNotFoundError(
-                    f'O Graph nao retornou resposta ao listar os drives do site {site_ref.id}.'
-                )
+        Quando ``pagination`` for ``False``, somente a primeira resposta do
+        Graph sera convertida. Quando for ``True``, o metodo
+        percorrera os links de continuacao ate a ultima pagina ou ate atingir
+        ``max_pages``. O limite conta a primeira pagina.
 
-            # 3. O Core espera a lista concreta de drives dentro de
-            #    `response.value`.
-            if not response.value:
+        Args:
+            site: Referencia semantica do site que possui os drives.
+            pagination: Controla se as paginas seguintes devem ser consultadas.
+            max_pages: Quantidade maxima de paginas processadas no cliente.
+
+        Returns:
+            Colecao semantica contendo os drives das paginas processadas.
+
+        Raises:
+            ValueError: Se ``max_pages`` for menor ou igual a zero.
+            DriveNotFoundError: Se o Graph nao devolver o envelope inicial.
+            GraphResponseError: Se alguma pagina nao puder ser interpretada.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
+
+        # Acumula apenas modelos internos. Os objetos `Drive` do SDK sao
+        # convertidos assim que cada pagina e processada.
+        pages: list[DocumentLibrary] = []
+
+        async def get_first_page(
+            site: SharePointSite,
+        ) -> DriveCollectionResponse:
+            """Solicita e valida o envelope inicial devolvido pelo Graph."""
+            try:
+                # A primeira requisicao parte do id do site. Sua resposta
+                # concreta determina o tipo usado pelo `PageIterator` nas
+                # requisicoes seguintes.
+                response = await self._client_manager.client.sites.by_site_id(
+                    site.id
+                ).drives.get()
+
+                # Sem envelope nao existe informacao suficiente para iniciar a
+                # conversao ou descobrir um eventual `odata_next_link`.
+                if not response:
+                    raise DriveNotFoundError(
+                        "O Graph nao retornou resposta ao listar os drives do "
+                        f"site {site.id}."
+                    )
+
+                # A primeira pagina deve trazer os itens em `value`. O link de
+                # continuacao, quando existir, fica em `odata_next_link`.
+                if not response.value:
+                    raise GraphResponseError(
+                        f"O Graph respondeu a listagem de drives do site {
+                            site.id
+                        }, mas o envelope veio sem itens em `value`."
+                    )
+
+            except DriveNotFoundError:
+                # Preserva o erro semantico e seu traceback original.
+                raise
+            except ODataError as error:
+                # Traduz a falha remota antes que um tipo do SDK atravesse a
+                # fronteira publica do servico.
+                raise parse_o_data_error(error, operation="list_site_drives")
+            else:
+                # O envelope permanece cru somente dentro deste metodo, pois
+                # ainda sera usado para construir o paginador.
+                return response
+
+        # Evita um limite ambiguo: zero ou valores negativos nao representam
+        # uma quantidade valida de paginas a processar.
+        if max_pages is not None and max_pages <= 0:
+            raise ValueError(
+                "Quando informado, max_pages não pode ser menor ou igual a zero"
+            )
+
+        # Toda operacao, paginada ou nao, precisa obter a primeira pagina.
+        first_page = await get_first_page(site=site)
+
+        # O fluxo sem paginacao converte somente o primeiro envelope e termina
+        # sem consultar seu `odata_next_link`.
+        if not pagination:
+            return parse_drive_collection_response(first_page)
+
+        # `PageIterator` normaliza o envelope inicial em `PageResult` e usa o
+        # request adapter autenticado para buscar os links seguintes.
+        page_iterator = PageIterator(
+            request_adapter=self._client_manager.client.request_adapter,
+            response=first_page,
+        )
+
+        # A pagina atual inicial corresponde ao proprio `first_page`; por isso
+        # ela deve ser processada antes da primeira chamada a `next()`.
+        current_page = page_iterator.current_page
+
+        # O contador representa paginas processadas, e nao quantidade de drives.
+        page_counter = 0
+
+        while current_page is not None:
+            # Cada `PageResult` guarda os itens crus da pagina em `value`.
+            if not current_page.value:
                 raise GraphResponseError(
-                    f'O Graph respondeu a listagem de drives do site {site_ref.id}, mas o envelope veio sem itens em `value`.'
+                    "Graph não retornou uma resposa válida para a página atual"
                 )
 
+            # Valida e converte cada model do SDK antes de adiciona-lo ao
+            # acumulador semantico.
+            for item in current_page.value:
+                if not isinstance(item, Drive):
+                    raise GraphResponseError(
+                        f"Erro ao efetuar o Parse de {type(item)} para DocumentLibrary"
+                    )
+
+                pages.append(parse_drive(item))
+
+            # A primeira pagina tambem participa do limite informado.
+            page_counter += 1
+
+            # Interrompe antes de fazer outra requisicao quando o limite local
+            # ja foi satisfeito.
+            if max_pages is not None and page_counter >= max_pages:
+                break
+
+            # `next()` devolve a proxima pagina ou `None` quando nao existe
+            # `odata_next_link`. Na versao instalada, ele nao atualiza sozinho
+            # `page_iterator.current_page`; esse estado precisa ser sincronizado
+            # antes de solicitar uma terceira pagina.
+            current_page = await page_iterator.next()
+
+            if not current_page:
+                break
+
+            page_iterator.current_page = current_page
+
+        # Nenhum envelope ou model do SDK e exposto para o consumidor.
+        return DocumentLibraryCollection.from_collection(pages)
+
+    async def find_drive_by_name(
+        self,
+        site: SharePointSite,
+        name: str,
+    ) -> DocumentLibrary | None:
+        """Busca um drive pelo nome entre as bibliotecas de um site.
+
+        A busca solicita a listagem paginada completa do site e compara
+        ``DocumentLibrary.name`` com o nome informado. A comparacao atual e exata e
+        diferencia letras maiusculas de minusculas.
+
+        Args:
+            name: Nome exato do drive que deve ser localizado.
+            site: Referencia semantica do site que sera pesquisado.
+
+        Returns:
+            O primeiro ``DocumentLibrary`` com nome correspondente ou ``None`` quando
+            nenhum drive satisfizer a busca.
+
+        Raises:
+            DriveNotFoundError: Se a listagem de drives do site falhar por
+                ausencia do recurso.
+            MSCronosError: Se a camada de listagem traduzir uma falha do Graph
+                para um erro semantico do Core.
+        """
+        try:
+            # Reutiliza a operacao publica de listagem para manter a paginacao
+            # e a conversao dos models do SDK concentradas em um unico metodo.
+            drivers = await self.list_site_drives(
+                site=site,
+                pagination=True,
+            )
+
+            # A colecao ja contem `DocumentLibrary`; nenhuma nova conversao do SDK e
+            # necessaria durante a busca.
+            for drive in drivers:
+                # O primeiro nome exatamente igual encerra a busca.
+                if drive.name == name:
+                    return drive
+
+            # Ao esgotar a colecao, o retorno implicito e `None`, conforme o
+            # contrato opcional da assinatura.
         except DriveNotFoundError:
-            # Falhas locais de envelope vazio sao preservadas como erro interno.
+            # Preserva o erro semantico produzido pela operacao de listagem.
             raise
-        except ODataError as error:
-            # O parser recebe o contexto da operacao para mapear melhor erros
-            # como `itemNotFound` e `resourceNotFound`.
-            raise parse_o_data_error(error, operation='list_site_drives')
-        else:
-            # 4. O envelope cru do SDK e adaptado para a colecao semantica do
-            #    Core antes de sair do servico.
-            return parse_drive_collection_response(response)
+        except ODataError as e:
+            # Mantem a traducao centralizada no parser de erros do Core.
+            parse_o_data_error(o_data_error=e, operation="get_drive_by_name")
+        except Exception:
+            # Falhas inesperadas conservam tipo, mensagem e traceback.
+            raise
 
     async def get_default_drive(
         self,
-        site_ref: SiteRef,
-    ) -> DriveRef:
-        '''Obtem o drive padrao do site a partir de um `SiteRef` ja resolvido.'''
+        site: SharePointSite,
+    ) -> DocumentLibrary:
+        """Obtem o drive padrao de um site resolvido.
 
+        Args:
+            site: Site cuja biblioteca padrao sera consultada.
+
+        Returns:
+            Referencia semantica do drive padrao.
+
+        Raises:
+            DefaultDriveNotFoundError: Se o Graph nao devolver o drive.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
         try:
-            # 1. Usa o `site_ref.id` para consultar diretamente o drive padrao do
-            #    site, sem listar todas as bibliotecas antes.
-            response = await self._client_manager.client.sites.by_site_id(site_ref.id).drive.get()
+            # 1. Usa o `site.id` para consultar diretamente o drive padrao
+            # do site, sem listar todas as bibliotecas antes.
+            response = await self._client_manager.client.sites.by_site_id(
+                site.id
+            ).drive.get()
 
-            # 2. Nesta rota o Graph devolve um `Drive` unico, nao um envelope de
-            #    colecao com `value`.
+            # 2. Nesta rota o Graph devolve um `Drive` unico, nao um envelope
+            # de colecao com `value`.
             if not response:
                 raise DefaultDriveNotFoundError(
-                    f'O Graph nao retornou o drive padrao do site {site_ref.id}.'
+                    f"Drive padrao nao retornado para o site {site.id}."
                 )
 
         except ODataError as error:
             # O parser centraliza a traducao para o erro semantico correto do
             # Core.
-            raise parse_o_data_error(error, operation='get_default_drive')
+            raise parse_o_data_error(error, operation="get_default_drive")
         else:
             # 3. O `Drive` cru retornado pelo SDK e convertido para o contrato
             #    interno enxuto antes de sair do servico.
             return parse_drive(response)
 
-    async def get_drive(
+    async def get_drive_by_id(
         self,
-        drive_ref: DriveRef,
-    ) -> DriveRef:
-        '''Reconsulta um drive especifico a partir de um `DriveRef`.
+        drive_id: str,
+    ) -> DocumentLibrary:
+        """Consulta um drive especifico pelo identificador.
 
-        Use quando voce ja tem um id de drive e quer confirmar ou atualizar os
+        Use quando voce ja tem o id de um drive e quer confirmar ou atualizar os
         metadados basicos desse drive.
-        '''
+
+        Args:
+            drive_id: Identificador do drive que sera consultado.
+
+        Returns:
+            Nova referencia semantica com os metadados retornados pelo Graph.
+
+        Raises:
+            DriveNotFoundError: Se o drive nao for encontrado.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
         try:
-            # 1. Reconsulta um drive especifico a partir do `drive_ref.id`.
-            response = await self._client_manager.client.drives.by_drive_id(drive_ref.id).get()
+            # 1. Reconsulta diretamente o drive pelo identificador informado.
+            response = await self._client_manager.client.drives.by_drive_id(
+                drive_id
+            ).get()
 
             # 2. Assim como em `get_default_drive`, aqui a resposta esperada e
             #    um `Drive` unico.
             if not response:
                 raise DriveNotFoundError(
-                    f'O Graph nao retornou o drive solicitado para o identificador {drive_ref.id}.'
+                    "O Graph nao retornou o drive solicitado para o "
+                    f"identificador {drive_id}."
                 )
 
         except DriveNotFoundError:
@@ -220,66 +488,98 @@ class SharePointService:
         except ODataError as error:
             # O parser centraliza a traducao para o erro semantico correto do
             # Core.
-            raise parse_o_data_error(error, operation='get_drive')
+            raise parse_o_data_error(error, operation="get_drive_by_id")
         else:
-            # 3. Converte o `Drive` cru do SDK para `DriveRef`.
+            # 3. Converte o `Drive` cru do SDK para `DocumentLibrary`.
             return parse_drive(response)
+
+    # Navegacao em itens do drive
 
     async def get_drive_root(
         self,
-        drive_ref: DriveRef,
-    ) -> DriveItemRef:
-        '''Retorna o `DriveItemRef` que representa a raiz do drive.'''
+        library: DocumentLibrary,
+    ) -> SharePointItem:
+        """Obtem o item que representa a raiz de um drive.
+
+        Args:
+            library: Drive cuja raiz sera consultada.
+
+        Returns:
+            Referencia semantica do ``DriveItem`` raiz.
+
+        Raises:
+            DriveNotFoundError: Se o Graph nao devolver a raiz.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
         try:
             # 1. Consulta o item raiz do drive, que no Graph e modelado como um
             #    `DriveItem`.
-            site_response = await self._client_manager.client.drives.by_drive_id(drive_ref.id).root.get()
+            site_response = await self._client_manager.client.drives.by_drive_id(
+                library.id
+            ).root.get()
 
             # 2. Nesta rota a resposta ja e um item unico, nao um envelope de
             #    colecao.
             if not site_response:
                 raise DriveNotFoundError(
-                    f'O Graph nao retornou a raiz do drive {drive_ref.id}.'
+                    f"O Graph nao retornou a raiz do drive {library.id}."
                 )
 
         except DriveNotFoundError:
-            # A raiz do drive e obrigatoria para navegacao; se nao veio resposta,
-            # o erro interno ja descreve o drive afetado.
+            # A raiz do drive e obrigatoria para navegacao. Se nao veio
+            # resposta, o erro interno ja descreve o drive afetado.
             raise
         except ODataError as error:
             # O parser centraliza a traducao para o erro semantico correto do
             # Core.
-            raise parse_o_data_error(error, operation='get_drive_root')
+            raise parse_o_data_error(error, operation="get_drive_root")
         else:
-            # 3. Converte o `DriveItem` raiz em `DriveItemRef`.
+            # 3. Converte o `DriveItem` raiz em `SharePointItem`.
             return parse_drive_item(site_response)
 
     async def list_children(
         self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-    ) -> DriveItemCollection:
-        '''Lista os filhos imediatos de uma pasta remota.
+        library: DocumentLibrary,
+        parent: SharePointItem,
+    ) -> SharePointItemCollection:
+        """Lista os filhos imediatos de uma pasta remota.
 
         A busca nao e recursiva: cada chamada representa exatamente um nivel da
         arvore remota.
-        '''
 
+        Args:
+            library: Drive que contem a pasta consultada.
+            parent: Pasta cujos filhos serao listados.
+
+        Returns:
+            Colecao semantica dos itens encontrados no nivel imediato.
+
+        Raises:
+            NotAFolderError: Se o item pai nao representar uma pasta.
+            DriveItemNotFoundError: Se o Graph nao devolver a listagem.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
         try:
-            # 1. Parte de um drive e de um item pai ja resolvidos para consultar
-            #    os filhos imediatos da pasta no Graph.
-            if not parent_item_ref.is_folder:
+            # 1. Parte de um drive e de um item pai ja resolvidos para
+            # consultar os filhos imediatos da pasta no Graph.
+            if not parent.is_folder:
                 raise NotAFolderError(
-                    f'O item {parent_item_ref.id} nao pode ser usado em list_children porque nao representa uma pasta.'
+                    f"O item {parent.id} nao pode ser usado em "
+                    "list_children porque nao representa uma pasta."
                 )
 
-            response = await self._client_manager.client.drives.by_drive_id(drive_ref.id).items.by_drive_item_id(parent_item_ref.id).children.get()
+            response = (
+                await self._client_manager.client.drives.by_drive_id(library.id)
+                .items.by_drive_item_id(parent.id)
+                .children.get()
+            )
 
             # 2. A rota de filhos devolve um envelope de colecao contendo
             #    `DriveItem`s em `response.value`.
             if not response:
                 raise DriveItemNotFoundError(
-                    f'O Graph nao retornou resposta ao listar os filhos do item {parent_item_ref.id} no drive {drive_ref.id}.'
+                    "O Graph nao retornou resposta ao listar os filhos do "
+                    f"item {parent.id} no drive {library.id}."
                 )
 
         except NotAFolderError:
@@ -287,29 +587,45 @@ class SharePointService:
             # contrato.
             raise
         except DriveItemNotFoundError:
-            # Envelope ausente ou item inacessivel continua como erro interno de
-            # DriveItem.
+            # Envelope ausente ou item inacessivel continua como erro interno
+            # de DriveItem.
             raise
         except ODataError as error:
             # O contexto da operacao ajuda o parser a diferenciar falhas de
             # pasta, item e drive.
-            raise parse_o_data_error(error, operation='list_children')
+            raise parse_o_data_error(error, operation="list_children")
         else:
-            # 3. O envelope cru e convertido para `DriveItemCollection`, que e a
-            #    forma semantica de navegacao usada pelo Core.
+            # 3. O envelope cru e convertido para `SharePointItemCollection`, a
+            # forma semantica de navegacao usada pelo Core.
             return parse_drive_item_collection_response(response)
+
+    # Busca de filhos imediatos
 
     async def find_child_by_name(
         self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
+        library: DocumentLibrary,
+        parent: SharePointItem,
         name: str,
-    ) -> Optional[DriveItemRef]:
-        '''Busca um filho imediato pelo nome dentro de uma pasta remota.'''
+    ) -> SharePointItem | None:
+        """Busca um filho imediato pelo nome dentro de uma pasta remota.
+
+        Args:
+            library: Drive que contem o item pai.
+            parent: Pasta em que a busca sera executada.
+            name: Nome exato do filho procurado.
+
+        Returns:
+            Primeiro filho correspondente ou ``None`` quando nao encontrado.
+
+        Raises:
+            NotAFolderError: Se o item pai nao representar uma pasta.
+            DriveItemNotFoundError: Se a listagem do pai falhar.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
         try:
             # Reaproveita `list_children` para manter uma unica rota de
             # navegacao remota.
-            children = await self.list_children(drive_ref, parent_item_ref)
+            children = await self.list_children(library, parent)
 
             # A busca e local aos filhos imediatos; nao percorre subpastas.
             for child in children:
@@ -328,23 +644,37 @@ class SharePointService:
         except ODataError as error:
             # O contexto da operacao ajuda o parser a diferenciar falhas de
             # pasta, item e drive.
-            raise parse_o_data_error(error, operation='list_children')
+            raise parse_o_data_error(error, operation="list_children")
 
     async def find_child_by_id(
         self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-        drive_id: str,
-    ) -> Optional[DriveItemRef]:
-        '''Busca um filho imediato pelo id dentro de uma pasta remota.'''
+        library: DocumentLibrary,
+        parent: SharePointItem,
+        item_id: str,
+    ) -> SharePointItem | None:
+        """Busca um filho imediato pelo identificador do DriveItem.
+
+        Args:
+            library: Drive que contem o item pai.
+            parent: Pasta em que a busca sera executada.
+            item_id: Identificador exato do filho procurado.
+
+        Returns:
+            Filho correspondente ou ``None`` quando nao encontrado.
+
+        Raises:
+            NotAFolderError: Se o item pai nao representar uma pasta.
+            DriveItemNotFoundError: Se a listagem do pai falhar.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
         try:
             # Reaproveita `list_children` para manter uma unica rota de
             # navegacao remota.
-            children = await self.list_children(drive_ref, parent_item_ref)
+            children = await self.list_children(library, parent)
 
             # A busca e local aos filhos imediatos; nao percorre subpastas.
             for child in children:
-                if child.id == drive_id:
+                if child.id == item_id:
                     return child
 
             # Nao encontrar o id entre os filhos diretos nao e erro remoto.
@@ -358,19 +688,33 @@ class SharePointService:
         except ODataError as error:
             # O contexto da operacao ajuda o parser a diferenciar falhas de
             # pasta, item e drive.
-            raise parse_o_data_error(error, operation='list_children')
+            raise parse_o_data_error(error, operation="list_children")
 
     async def find_child_by_web_url(
         self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
+        library: DocumentLibrary,
+        parent: SharePointItem,
         web_url: str,
-    ) -> Optional[DriveItemRef]:
-        '''Busca um filho imediato pela URL web dentro de uma pasta remota.'''
+    ) -> SharePointItem | None:
+        """Busca um filho imediato por sua URL web.
+
+        Args:
+            library: Drive que contem o item pai.
+            parent: Pasta em que a busca sera executada.
+            web_url: URL web exata do filho procurado.
+
+        Returns:
+            Filho correspondente ou ``None`` quando nao encontrado.
+
+        Raises:
+            NotAFolderError: Se o item pai nao representar uma pasta.
+            DriveItemNotFoundError: Se a listagem do pai falhar.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
         try:
             # Reaproveita `list_children` para manter uma unica rota de
             # navegacao remota.
-            children = await self.list_children(drive_ref, parent_item_ref)
+            children = await self.list_children(library, parent)
 
             # A busca e local aos filhos imediatos; nao percorre subpastas.
             for child in children:
@@ -388,28 +732,45 @@ class SharePointService:
         except ODataError as error:
             # O contexto da operacao ajuda o parser a diferenciar falhas de
             # pasta, item e drive.
-            raise parse_o_data_error(error, operation='list_children')
+            raise parse_o_data_error(error, operation="list_children")
 
     async def find_child_folder(
         self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
+        library: DocumentLibrary,
+        parent: SharePointItem,
         name: str,
-    ) -> Optional[DriveItemRef]:
-        '''Busca uma pasta filha imediata pelo nome.'''
+    ) -> SharePointItem | None:
+        """Busca uma pasta filha imediata pelo nome.
+
+        Args:
+            library: Drive que contem a pasta pai.
+            parent: Pasta em que a busca sera executada.
+            name: Nome exato da pasta procurada.
+
+        Returns:
+            Referencia da pasta ou ``None`` quando nao encontrada.
+
+        Raises:
+            NotAFolderError: Se o pai nao for pasta ou se o nome pertencer a
+                um arquivo.
+            DriveItemNotFoundError: Se a listagem do pai falhar.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
         try:
             # A busca de pasta parte da mesma listagem imediata usada pelos
             # buscadores genericos; ela nao percorre subpastas.
-            child = await self.find_child_by_name(drive_ref, parent_item_ref, name=name)
+            child = await self.find_child_by_name(library, parent, name=name)
 
-            # Cada filho encontrado pode ser arquivo ou pasta. Se o nome bate com
-            # um arquivo, isso e um conflito de tipo para este contrato.
+            # Cada filho pode ser arquivo ou pasta. Se o nome coincide com um
+            # arquivo, isso e um conflito de tipo para este contrato.
             if not child:
                 return None
 
             if child.is_file:
                 raise NotAFolderError(
-                    f"Conflito de tipo ao buscar pasta filha '{name}': existe um arquivo com esse nome no item pai {parent_item_ref.id}."
+                    f"Conflito de tipo ao buscar pasta filha '{
+                        name
+                    }': existe um arquivo com esse nome no item pai {parent.id}."
                 )
             # Se o nome bate e nao houve conflito de arquivo, o item pode ser
             # usado como pasta remota de destino/navegacao.
@@ -427,28 +788,45 @@ class SharePointService:
         # Erros OData crus do SDK sao traduzidos para a hierarquia semantica do
         # Core antes de atravessar a fronteira do servico.
         except ODataError as error:
-            raise parse_o_data_error(error, operation='find_child_folder')
+            raise parse_o_data_error(error, operation="find_child_folder")
 
     async def find_child_file(
         self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
+        library: DocumentLibrary,
+        parent: SharePointItem,
         name: str,
-    ) -> Optional[DriveItemRef]:
-        '''Busca um arquivo filho imediato pelo nome.'''
+    ) -> SharePointItem | None:
+        """Busca um arquivo filho imediato pelo nome.
+
+        Args:
+            library: Drive que contem a pasta pai.
+            parent: Pasta em que a busca sera executada.
+            name: Nome exato do arquivo procurado.
+
+        Returns:
+            Referencia do arquivo ou ``None`` quando nao encontrado.
+
+        Raises:
+            NotAFileError: Se o nome corresponder a uma pasta.
+            NotAFolderError: Se o item pai nao representar uma pasta.
+            DriveItemNotFoundError: Se a listagem do pai falhar.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
         try:
             # A busca de arquivo reaproveita a mesma listagem imediata usada
             # pelos demais buscadores; ela nao percorre subpastas.
-            child = await self.find_child_by_name(drive_ref, parent_item_ref, name=name)
+            child = await self.find_child_by_name(library, parent, name=name)
 
-            # Cada filho encontrado pode ser arquivo ou pasta. Se o nome bate com
-            # uma pasta, isso e um conflito de tipo para este contrato.
+            # Cada filho pode ser arquivo ou pasta. Se o nome coincide com uma
+            # pasta, isso e um conflito de tipo para este contrato.
             if not child:
                 return None
 
             if child.is_folder:
                 raise NotAFileError(
-                    f"Conflito de tipo ao buscar arquivo filho '{name}': existe uma pasta com esse nome no item pai {parent_item_ref.id}."
+                    f"Conflito de tipo ao buscar arquivo filho '{
+                        name
+                    }': existe uma pasta com esse nome no item pai {parent.id}."
                 )
             # Se o nome bate e nao houve conflito de pasta, o item pode ser
             # usado como arquivo remoto de destino/substituicao.
@@ -466,40 +844,53 @@ class SharePointService:
         # Erros OData crus do SDK sao traduzidos para a hierarquia semantica do
         # Core antes de atravessar a fronteira do servico.
         except ODataError as error:
-            raise parse_o_data_error(error, operation='find_child_file')
+            raise parse_o_data_error(error, operation="find_child_file")
 
     async def find_child_folder_by_id(
         self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-        drive_id: str,
-    ) -> Optional[DriveItemRef]:
-        '''Busca uma pasta filha imediata pelo id do DriveItem.'''
+        library: DocumentLibrary,
+        parent: SharePointItem,
+        item_id: str,
+    ) -> SharePointItem | None:
+        """Busca uma pasta filha imediata pelo identificador do DriveItem.
+
+        Args:
+            library: Drive que contem a pasta pai.
+            parent: Pasta em que a busca sera executada.
+            item_id: Identificador exato da pasta procurada.
+
+        Returns:
+            Referencia da pasta ou ``None`` quando nao encontrada.
+
+        Raises:
+            NotAFolderError: Se o pai nao for pasta ou se o id pertencer a
+                um arquivo.
+            DriveItemNotFoundError: Se a listagem do pai falhar.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
         try:
             # Reaproveita a listagem imediata do pai; ids de DriveItem sao
             # comparados apenas entre os filhos diretos retornados pelo Graph.
-            children = await self.list_children(drive_ref, parent_item_ref)
+            children = await self.list_children(library, parent)
 
-            # Um arquivo com o mesmo id procurado quebra o contrato desta funcao,
-            # que promete devolver apenas pastas.
+            # Um arquivo com o mesmo id quebra o contrato desta funcao, que
+            # promete devolver apenas pastas.
             for child in children:
-
-                if child.id == drive_id and child.is_file:
-
+                if child.id == item_id and child.is_file:
                     raise NotAFolderError(
-                        f"Conflito de tipo ao buscar pasta filha pelo id '{drive_id}': \
-                        o item encontrado é um arquivo, não uma pasta."
+                        "Conflito de tipo ao buscar pasta filha pelo id "
+                        f"'{item_id}': o item encontrado e um arquivo."
                     )
                 # Se o id bate e nao houve conflito de arquivo, devolve o item
                 # como pasta candidata.
-                if child.id == drive_id:
+                if child.id == item_id:
                     return child
 
             # Id nao encontrado entre filhos imediatos.
             return None
 
-        # Pode vir da validacao do pai em `list_children` ou do conflito de tipo
-        # detectado neste escopo.
+        # Pode vir da validacao do pai em `list_children` ou do conflito
+        # de tipo detectado neste escopo.
         except NotAFolderError:
             raise
 
@@ -509,37 +900,53 @@ class SharePointService:
             raise
         # Traduz erros remotos do SDK para erros internos do Core.
         except ODataError as error:
-            raise parse_o_data_error(error, operation='find_child_folder')
+            raise parse_o_data_error(error, operation="find_child_folder")
 
     async def find_child_folder_web_url(
         self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
+        library: DocumentLibrary,
+        parent: SharePointItem,
         web_url: str,
-    ) -> Optional[DriveItemRef]:
-        '''Busca uma pasta filha imediata pela URL web do DriveItem.'''
+    ) -> SharePointItem | None:
+        """Busca uma pasta filha imediata pela URL web do DriveItem.
+
+        Args:
+            library: Drive que contem a pasta pai.
+            parent: Pasta em que a busca sera executada.
+            web_url: URL web exata da pasta procurada.
+
+        Returns:
+            Referencia da pasta ou ``None`` quando nao encontrada.
+
+        Raises:
+            NotAFolderError: Se o pai nao for pasta ou se a URL pertencer a
+                um arquivo.
+            DriveItemNotFoundError: Se a listagem do pai falhar.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
         try:
-            # A URL web e comparada apenas entre os filhos imediatos do item pai.
-            children = await self.list_children(drive_ref, parent_item_ref)
+            # A URL web e comparada apenas entre os filhos imediatos do item
+            # pai.
+            children = await self.list_children(library, parent)
 
-            # Se a URL apontar para arquivo, o resultado existe mas nao satisfaz
-            # o contrato de pasta.
+            # Se a URL apontar para arquivo, o resultado existe, mas nao
+            # satisfaz o contrato de pasta.
             for child in children:
-
                 if child.web_url == web_url and child.is_file:
-
                     raise NotAFolderError(
-                        f"Conflito de tipo ao buscar pasta filha pela URL '{web_url}': o item encontrado é um arquivo, não uma pasta."
+                        "Conflito de tipo ao buscar pasta filha pela URL "
+                        f"'{web_url}': o item encontrado e um arquivo."
                     )
-                # URL encontrada em um item que nao foi classificado como arquivo.
+                # URL encontrada em um item que nao foi classificado como
+                # arquivo.
                 if child.web_url == web_url:
                     return child
 
             # URL nao encontrada entre filhos imediatos.
             return None
 
-        # Pode vir da validacao do pai em `list_children` ou do conflito de tipo
-        # detectado neste escopo.
+        # Pode vir da validacao do pai em `list_children` ou do conflito
+        # de tipo detectado neste escopo.
         except NotAFolderError:
             raise
 
@@ -548,38 +955,59 @@ class SharePointService:
             raise
         # Traduz erros remotos do SDK para erros internos do Core.
         except ODataError as error:
-            raise parse_o_data_error(error, operation='find_child_folder')
+            raise parse_o_data_error(error, operation="find_child_folder")
+
+    # Criacao e garantia de pastas
 
     async def create_folder(
         self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
+        library: DocumentLibrary,
+        parent: SharePointItem,
         folder_name: str,
-        conflict_behavior: Literal['fail', 'rename', 'replace'] = 'fail'
-    ) -> DriveItemRef:
-        '''Cria uma pasta filha imediata dentro de uma pasta remota.'''
+        conflict_behavior: ConflictBehavior = "fail",
+    ) -> SharePointItem:
+        """Cria uma pasta filha imediata dentro de uma pasta remota.
 
+        Args:
+            library: Drive em que a pasta sera criada.
+            parent: Pasta remota que recebera o novo filho.
+            folder_name: Nome da pasta que sera criada.
+            conflict_behavior: Politica aplicada quando o nome ja existir.
+
+        Returns:
+            Referencia semantica da pasta criada pelo Graph.
+
+        Raises:
+            NotAFolderError: Se o item pai nao representar uma pasta.
+            InvalidRemoteNameError: Se o nome remoto for invalido.
+            InvalidConflictBehaviorError: Se a politica nao for suportada.
+            FailedWhenCreateDriveItemError: Se o Graph nao devolver o item.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
         try:
             # Criacao de pasta sempre acontece dentro de outro `DriveItem` que
             # precisa representar uma pasta remota.
-            if not parent_item_ref.is_folder:
-                raise NotAFolderError(
-                    f'{parent_item_ref} não é um Folder válido')
+            if not parent.is_folder:
+                raise NotAFolderError(f"{parent} não é um Folder válido")
 
             # O builder concentra a regra de montagem do body Graph: nome,
             # facet `folder` e comportamento de conflito.
             body = build_folder_drive_item(folder_name, conflict_behavior)
 
-            # A rota cria um novo filho sob o item pai informado. O id do pai ja
-            # identifica a posicao remota; nao ha concatenacao manual de path.
-            response = await self._client_manager.client.drives.by_drive_id(drive_ref.id) \
-                .items.by_drive_item_id(parent_item_ref.id).children.post(body)
+            # A rota cria um novo filho sob o item pai. O id do pai identifica
+            # a posicao remota; nao ha concatenacao manual de path.
+            response = (
+                await self._client_manager.client.drives.by_drive_id(library.id)
+                .items.by_drive_item_id(parent.id)
+                .children.post(body)
+            )
 
             # Uma criacao sem body de resposta nao consegue ser convertida para
-            # `DriveItemRef`, entao falha antes do parser.
+            # `SharePointItem`, entao falha antes do parser.
             if not response:
                 raise FailedWhenCreateDriveItemError(
-                    'Erro ao criar o Folder especificado')
+                    "Erro ao criar o Folder especificado"
+                )
         except (
             NotAFolderError,
             InvalidRemoteNameError,
@@ -592,7 +1020,7 @@ class SharePointService:
         except ODataError as error:
             # Erros crus do SDK sao traduzidos para a hierarquia semantica do
             # Core no limite do servico.
-            raise parse_o_data_error(error, operation='create_folder')
+            raise parse_o_data_error(error, operation="create_folder")
 
         else:
             # O SDK devolve um `DriveItem`; o Core expõe apenas a referencia
@@ -601,34 +1029,56 @@ class SharePointService:
 
     async def ensure_remote_folder_path(
         self,
-        drive_ref: DriveRef,
-        root_item: DriveItemRef,
+        library: DocumentLibrary,
+        root: SharePointItem,
         folders_parts: Sequence[str],
-        conflict_behavior: Literal['fail', 'rename', 'replace'] = 'fail'
-    ) -> DriveItemRef:
-        '''Garante uma cadeia de pastas remotas a partir de uma pasta raiz.'''
+        conflict_behavior: ConflictBehavior = "fail",
+    ) -> SharePointItem:
+        """Garante uma cadeia de pastas remotas a partir de uma pasta raiz.
 
+        Cada parte e buscada entre os filhos imediatos da pasta atual. Pastas
+        ausentes sao criadas antes que o metodo avance para o proximo nivel.
+        Uma sequencia vazia devolve o proprio ``root``.
+
+        Args:
+            library: Drive que contem a hierarquia remota.
+            root: Pasta usada como ponto inicial da navegacao.
+            folders_parts: Nomes ordenados dos niveis que devem existir.
+            conflict_behavior: Politica usada ao criar pastas ausentes.
+
+        Returns:
+            Referencia da ultima pasta da cadeia garantida.
+
+        Raises:
+            NotAFolderError: Se a raiz ou algum item encontrado nao for pasta.
+            DriveItemNotFoundError: Se uma busca intermediaria falhar.
+            InvalidRemoteNameError: Se alguma parte tiver nome invalido.
+            InvalidConflictBehaviorError: Se a politica nao for suportada.
+            FailedWhenCreateDriveItemError: Se uma criacao nao for concluida.
+        """
         try:
             # A navegacao sempre parte de uma pasta remota ja resolvida. Quando
             # `folders_parts` vier vazio, esta propria pasta sera retornada.
-            if not root_item.is_folder:
-                raise NotAFolderError(f'{root_item} não é um Folder válido')
+            if not root.is_folder:
+                raise NotAFolderError(f"{root} não é um Folder válido")
 
-            current_part: DriveItemRef = root_item
+            current_part: SharePointItem = root
 
             # Cada parte representa exatamente um nivel da arvore remota. A
             # funcao nao concatena ids nem caminhos; ela sempre navega a partir
-            # do `DriveItemRef` atual.
+            # do `SharePointItem` atual.
             for folder_part in folders_parts:
-                # Primeiro tentamos reaproveitar uma pasta filha imediata que ja
-                # exista sob o item atual.
-                finded_item = await self.find_child_folder(drive_ref, current_part, folder_part)
+                # Primeiro tentamos reaproveitar uma pasta filha imediata
+                # existente sob o item atual.
+                finded_item = await self.find_child_folder(
+                    library, current_part, folder_part
+                )
 
                 if not finded_item:
                     # Quando a pasta nao existe, criamos exatamente neste nivel
                     # e seguimos a navegacao a partir do item recem-criado.
-                    created_part: DriveItemRef = await self.create_folder(
-                        drive_ref,
+                    created_part: SharePointItem = await self.create_folder(
+                        library,
                         current_part,
                         folder_part,
                         conflict_behavior,
@@ -636,12 +1086,12 @@ class SharePointService:
                     current_part = created_part
                     continue
 
-                # Quando a pasta ja existe, ela se torna o novo ponto de partida
-                # para a proxima parte do caminho.
+                # Quando a pasta ja existe, ela se torna o novo ponto
+                # de partida para a proxima parte do caminho.
                 current_part = finded_item
 
             # O retorno sempre representa a pasta final da cadeia solicitada ou
-            # o proprio `root_item` quando nenhuma parte foi informada.
+            # o proprio `root` quando nenhuma parte foi informada.
             return current_part
         except (
             NotAFolderError,
@@ -654,56 +1104,139 @@ class SharePointService:
             # vierem das etapas de busca/criacao.
             raise
 
-    async def upload_small_file(
+    # Upload de arquivos
+
+    async def upload(
         self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
+        library: DocumentLibrary,
+        parent: SharePointItem,
         local_file: LocalFile,
-        conflict_behavior: Literal["fail", "rename", "replace"] = 'fail',
-        ) -> UploadResult:
+        conflict_behavior: ConflictBehavior = "fail",
+    ) -> FileUploadResult:
+        """Envia um arquivo usando o fluxo adequado ao seu tamanho.
+
+        Arquivos de ate ``MAX_SMALL_FILE_SIZE`` usam upload direto. Arquivos
+        maiores usam uma sessao resumivel e sao transmitidos em partes.
+
+        Args:
+            library: Drive remoto que recebera o arquivo.
+            parent: Pasta remota de destino.
+            local_file: Arquivo local preparado para envio.
+            conflict_behavior: Politica para nomes remotos ja existentes.
+
+        Returns:
+            Resultado semantico com o item remoto e os dados do envio.
+
+        Raises:
+            NotAFolderError: Se o destino remoto nao representar uma pasta.
+            LocalPathNotFoundError: Se o caminho local nao existir.
+            LocalPathIsDirectoryError: Se o caminho local for um diretorio.
+            LocalFileNotReadableError: Se o arquivo nao puder ser lido.
+            UploadError: Se o fluxo escolhido nao concluir o envio.
+        """
+
+        if not parent.is_folder:
+            raise NotAFolderError(f"{parent.name} não é um Folder válido")
+        if not local_file.path.exists():
+            raise LocalPathNotFoundError("O caminho para o arquivo local não existe")
+
+        if not local_file.path.is_file():
+            raise LocalPathIsDirectoryError(
+                "O caminho passado aponta para um diretório"
+            )
+
+        if not local_file.size:
+            raise LocalFileNotReadableError("Não foi possível ler o arquivo passado")
+
+        if local_file.size > MAX_SMALL_FILE_SIZE:
+            return await self._upload_large_file(
+                library=library,
+                parent=parent,
+                local_file=local_file,
+                conflict_behavior=conflict_behavior,
+            )
+        return await self._upload_small_file(
+            library=library,
+            parent=parent,
+            local_file=local_file,
+            conflict_behavior=conflict_behavior,
+        )
+
+    # Implementacao interna de upload
+
+    async def _upload_small_file(
+        self,
+        library: DocumentLibrary,
+        parent: SharePointItem,
+        local_file: LocalFile,
+        conflict_behavior: ConflictBehavior = "fail",
+    ) -> FileUploadResult:
         """Envia um arquivo pequeno por PUT direto no endpoint `/content`.
 
         O fluxo decide entre criar ou substituir de acordo com a existencia do
         arquivo remoto e com o `conflict_behavior` informado.
+
+        Args:
+            library: Drive remoto que recebera o arquivo.
+            parent: Pasta remota de destino.
+            local_file: Arquivo local que sera lido integralmente em memoria.
+            conflict_behavior: Politica para conflito de nome remoto.
+
+        Returns:
+            Resultado semantico do arquivo criado ou substituido.
+
+        Raises:
+            NotAFolderError: Se o destino remoto nao representar uma pasta.
+            LocalPathNotFoundError: Se o caminho local nao existir.
+            LocalPathIsDirectoryError: Se o caminho local for um diretorio.
+            LocalFileNotReadableError: Se a leitura local falhar.
+            FileVeryLargeError: Se o arquivo exceder o limite deste fluxo.
+            FileAlreadyExistError: Se houver conflito no modo ``fail``.
+            SmallFileUploadError: Se o Graph nao devolver o item enviado.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
         """
-        if not parent_item_ref.is_folder:
+        if not parent.is_folder:
             raise NotAFolderError(
-                f'O item {parent_item_ref.id} nao pode receber upload porque nao representa uma pasta.'
+                f"O item {
+                    parent.id
+                } nao pode receber upload porque nao representa uma pasta."
             )
 
         if not local_file.path.exists():
             raise LocalPathNotFoundError(
-                f'O caminho local informado nao existe: {local_file.path}'
+                f"O caminho local informado nao existe: {local_file.path}"
             )
         if not local_file.path.is_file():
             raise LocalPathIsDirectoryError(
-                f'O caminho local precisa apontar para um arquivo, mas recebeu: {local_file.path}'
+                f"Caminho local nao e um arquivo: {local_file.path}"
             )
         if local_file.size is not None and local_file.size > 250_000_000:
             raise FileVeryLargeError(
-                f'O arquivo {local_file.path} excede o limite de 250 MB do upload pequeno.'
+                f"O arquivo {
+                    local_file.path
+                } excede o limite de 250 MB do upload pequeno."
             )
 
         try:
-            # O fluxo pequeno trabalha com o arquivo inteiro em memoria, entao a
-            # leitura local precisa acontecer antes do `PUT`.
+            # O fluxo pequeno trabalha com o arquivo inteiro em memoria.
+            # Portanto, a leitura local acontece antes do `PUT`.
             content_bytes = local_file.path.read_bytes()
         except OSError as error:
             raise LocalFileNotReadableError(
-                f'Nao foi possivel ler o arquivo local para upload: {local_file.path}'
+                f"Falha ao ler o arquivo local: {local_file.path}"
             ) from error
 
         try:
             # O staging concentra o nome remoto final e o fragmento de rota
             # usado na criacao por nome.
-            staging_content: StagingContentUpload = build_upload_content(
+            staging_content: PreparedUpload = build_upload_content(
                 local_file,
                 None,
                 conflict_behavior,
             )
             existing_file = await self.find_child_file(
-                drive_ref,
-                parent_item_ref,
+                library,
+                parent,
                 local_file.name,
             )
 
@@ -714,22 +1247,23 @@ class SharePointService:
                 # Sem conflito remoto, o upload pequeno cria o arquivo usando a
                 # rota `items/{parent-id}:/{filename}:/content`.
                 create_url = build_drive_create_content_url(
-                    drive_ref.id,
-                    parent_item_ref.id,
+                    library.id,
+                    parent.id,
                     staging_content.target_path,
                 )
                 response = await (
-                    self._client_manager.client.drives
-                    .by_drive_id(drive_ref.id)
-                    .items.by_drive_item_id(parent_item_ref.id)
+                    self._client_manager.client.drives.by_drive_id(library.id)
+                    .items.by_drive_item_id(parent.id)
                     .content.with_url(create_url)
                     .put(content_bytes)
                 )
-            elif staging_content.conflict_behavior == 'fail':
+            elif staging_content.conflict_behavior == "fail":
                 raise FileAlreadyExistError(
-                    f'Ja existe um arquivo chamado {local_file.name} na pasta remota {parent_item_ref.id}.'
+                    f"Ja existe um arquivo chamado {local_file.name} na pasta remota {
+                        parent.id
+                    }."
                 )
-            elif staging_content.conflict_behavior == 'rename':
+            elif staging_content.conflict_behavior == "rename":
                 # Em modo `rename`, o Core gera um novo nome remoto e tenta a
                 # criacao novamente sob o mesmo pai.
                 remote_name = rename_with_uuid(local_file.name)
@@ -739,14 +1273,13 @@ class SharePointService:
                     conflict_behavior,
                 )
                 create_url = build_drive_create_content_url(
-                    drive_ref.id,
-                    parent_item_ref.id,
+                    library.id,
+                    parent.id,
                     staging_content.target_path,
                 )
                 response = await (
-                    self._client_manager.client.drives
-                    .by_drive_id(drive_ref.id)
-                    .items.by_drive_item_id(parent_item_ref.id)
+                    self._client_manager.client.drives.by_drive_id(library.id)
+                    .items.by_drive_item_id(parent.id)
                     .content.with_url(create_url)
                     .put(content_bytes)
                 )
@@ -754,8 +1287,7 @@ class SharePointService:
                 # Em modo `replace`, o upload usa diretamente o `item_id` do
                 # arquivo existente e substitui apenas o conteudo.
                 response = await (
-                    self._client_manager.client.drives
-                    .by_drive_id(drive_ref.id)
+                    self._client_manager.client.drives.by_drive_id(library.id)
                     .items.by_drive_item_id(existing_file.id)
                     .content.put(content_bytes)
                 )
@@ -763,13 +1295,14 @@ class SharePointService:
 
             if not response:
                 raise SmallFileUploadError(
-                    f'O Graph nao retornou um DriveItem apos o upload pequeno de {local_file.path}.'
+                    "O Graph nao retornou um DriveItem apos o upload pequeno "
+                    f"de {local_file.path}."
                 )
 
             # O retorno do SDK ainda e um `DriveItem`; o parser o reduz para a
             # referencia semantica usada pelo restante do Core.
             uploaded_item = parse_drive_item(response)
-            return UploadResult(
+            return FileUploadResult(
                 item=uploaded_item,
                 source_path=local_file.path,
                 conflict_behavior=staging_content.conflict_behavior,
@@ -790,4 +1323,166 @@ class SharePointService:
         ):
             raise
         except ODataError as error:
-            raise parse_o_data_error(error, operation='upload_small_file')
+            raise parse_o_data_error(error, operation="upload_small_file")
+
+    async def _upload_large_file(
+        self,
+        library: DocumentLibrary,
+        parent: SharePointItem,
+        local_file: LocalFile,
+        conflict_behavior: ConflictBehavior = "fail",
+    ) -> FileUploadResult:
+        """Envia um arquivo grande usando uma upload session do Graph.
+
+        O metodo valida o destino e o caminho local, solicita uma sessao
+        remota, abre o arquivo como stream binario e delega a divisao e o
+        envio dos chunks ao `LargeFileUploadTask`.
+
+        Args:
+            library: Drive que contem a pasta remota de destino.
+            parent: Pasta remota que recebera o arquivo.
+            local_file: Arquivo local preparado para envio.
+            conflict_behavior: Comportamento solicitado quando o nome remoto ja
+                existir.
+
+        Returns:
+            Resultado semantico com a referencia do item remoto enviado.
+
+        Raises:
+            NotAFolderError: Se o item remoto de destino nao for uma pasta.
+            LocalPathNotFoundError: Se o caminho local nao existir.
+            LocalPathIsDirectoryError: Se o caminho local for um diretorio.
+            UploadError: Se o Graph nao devolver o item concluido.
+            RuntimeError: Se a task nao concluir o upload.
+        """
+        # O endpoint de sessao cria o arquivo como filho de um item pasta.
+        if not parent.is_folder:
+            raise NotAFolderError(f"O item {parent.id} nao e uma pasta de destino.")
+
+        # As validacoes locais evitam criar uma sessao que nao podera ser
+        # usada.
+        if not local_file.path.exists():
+            raise LocalPathNotFoundError(
+                f"Caminho local invalido para arquivo: {local_file.path}"
+            )
+
+        if not local_file.path.is_file():
+            raise LocalPathIsDirectoryError(
+                f"O caminho {local_file.path} aponta para um diretório"
+            )
+
+        try:
+            upload_session = await self._create_upload_session(
+                library=library,
+                parent=parent,
+                local_file=local_file,
+                conflict_behavior=conflict_behavior,
+            )
+
+            # O context manager garante o fechamento do descritor local ao fim
+            # do envio ou quando uma excecao interromper o fluxo.
+            with local_file.path.open("rb") as file_stream:
+                # A task usa a sessao pre-autenticada para controlar os
+                # ranges e enviar cada trecho do stream.
+                upload_task = LargeFileUploadTask(
+                    upload_session=upload_session,
+                    request_adapter=(self._client_manager.client.request_adapter),
+                    stream=file_stream,  # type: ignore
+                    parsable_factory=DriveItem,
+                    max_chunk_size=MAX_CHUNK_SIZE,
+                )
+                upload_result = await upload_task.upload()
+
+            # O resultado cru do SDK informa se a task considera o envio
+            # concluido.
+            if not upload_result.upload_succeeded:
+                raise RuntimeError(f"Upload nao concluido para {local_file.name}")
+        except LocalPathNotFoundError:
+            raise
+        except LocalPathIsDirectoryError:
+            raise
+        except RuntimeError:
+            raise
+        if not upload_result.item_response:
+            raise UploadError("Não foi possível completar o Upload")
+
+        uploaded_drive_item = parse_drive_item(upload_result.item_response)
+
+        return FileUploadResult(
+            item=uploaded_drive_item,
+            source_path=local_file.path,
+            remote_name=uploaded_drive_item.name
+            if uploaded_drive_item.name is not None
+            else "",
+            conflict_behavior=conflict_behavior,
+        )
+
+    async def _create_upload_session(
+        self,
+        library: DocumentLibrary,
+        parent: SharePointItem,
+        local_file: LocalFile,
+        conflict_behavior: ConflictBehavior = "fail",
+    ) -> UploadSession:
+        """Cria a sessao remota usada pelo fluxo de upload grande.
+
+        Este helper nao envia bytes. Ele valida o arquivo local, monta o body
+        esperado pelo SDK e solicita ao Graph uma `UploadSession` com URL
+        pre-autenticada.
+
+        Args:
+            library: Drive que contem a pasta remota.
+            parent: Pasta remota em que o arquivo sera criado.
+            local_file: Arquivo local associado a sessao.
+            conflict_behavior: Politica de conflito enviada ao Graph.
+
+        Returns:
+            Uma `UploadSession` com `upload_url` preenchida.
+
+        Raises:
+            LocalPathNotFoundError: Se o caminho local nao existir.
+            LocalPathIsDirectoryError: Se o caminho local for um diretorio.
+            LocalFileNotReadableError: Se o arquivo estiver vazio.
+            RuntimeError: Se o Graph nao devolver uma sessao utilizavel.
+        """
+        # O helper repete as validacoes para continuar seguro caso passe a ser
+        # chamado por outro fluxo interno.
+        if not local_file.path.exists():
+            raise LocalPathNotFoundError(
+                f"Caminho local invalido para arquivo: {local_file.path}"
+            )
+
+        if not local_file.path.is_file():
+            raise LocalPathIsDirectoryError(
+                f"O caminho {local_file.path} aponta para um diretório"
+            )
+
+        if local_file.size == 0:
+            raise LocalFileNotReadableError(
+                f"O caminho {local_file.path} aponta para um caminho vazio"
+            )
+
+        # As propriedades uploadable carregam metadados aplicados ao arquivo
+        # remoto quando a sessao for finalizada.
+        uploadable_propieties = DriveItemUploadableProperties(
+            additional_data={"@microsoft.graph.conflictBehavior": conflict_behavior}
+        )
+
+        request_body = CreateUploadSessionPostRequestBody(item=uploadable_propieties)
+
+        # O endereco por path combina o id do pai com o nome do arquivo
+        # que sera criado ou resolvido pelo Graph.
+        upload_session = await (
+            self._client_manager.client.drives.by_drive_id(library.id)
+            .items.by_drive_item_id(f"{parent.id}:/{local_file.name}:")
+            .create_upload_session.post(request_body)
+        )
+
+        # A task de upload precisa obrigatoriamente da URL pre-autenticada.
+        if upload_session is None:
+            raise RuntimeError("O Microsoft Graph não retornou uma URL válida")
+
+        if upload_session.upload_url is None:
+            raise RuntimeError("A sessão retornada não possui url")
+
+        return upload_session

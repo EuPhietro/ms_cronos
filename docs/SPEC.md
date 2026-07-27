@@ -32,7 +32,8 @@ diretorio local
 - suportar navegacao semantica por site, drive e item;
 - suportar criacao incremental de pastas remotas;
 - suportar upload pequeno com politica de conflito clara;
-- preparar o terreno para upload grande e upload recursivo de diretorios.
+- suportar upload grande com sessao resumivel;
+- preparar a abstracao completa do SDK e o upload recursivo de diretorios.
 
 ## Nao Objetivos da Fase Atual
 
@@ -110,7 +111,7 @@ SiteRef
 DriveRef
 DriveItemRef
 LocalFile
-UploadResult
+UploadFileResult
 ```
 
 ## Contratos do Core
@@ -125,7 +126,7 @@ Os modelos internos mais importantes hoje sao:
 - `DriveItemRef`
 - `LocalFile`
 - `StagingContentUpload`
-- `UploadResult`
+- `UploadFileResult`
 
 ### Exemplo de modelos
 
@@ -163,7 +164,7 @@ root = DriveItemRef(
     size=0,
 )
 
-local_file = LocalFile.from_path(Path("/tmp/relatorio.csv"))
+local_file = LocalFile.from_uri(Path("/tmp/relatorio.csv"))
 ```
 
 ### Colecoes
@@ -259,9 +260,7 @@ Exemplo:
 ```python
 from core import build_graph_site_url
 
-graph_url = build_graph_site_url(
-    "https://tenant.sharepoint.com/sites/RHConecta"
-)
+graph_url = build_graph_site_url("https://tenant.sharepoint.com/sites/RHConecta")
 ```
 
 ### `core/builders.py`
@@ -280,7 +279,7 @@ from core.builders import build_folder_drive_item, build_upload_content
 
 body = build_folder_drive_item("Relatorios", conflict_behavior="rename")
 
-local_file = LocalFile.from_path("/tmp/relatorio.pdf")
+local_file = LocalFile.from_uri("/tmp/relatorio.pdf")
 staging = build_upload_content(local_file, None, conflict_behavior="replace")
 ```
 
@@ -373,7 +372,14 @@ class SharePointService:
         parent_item_ref: DriveItemRef,
         local_file: LocalFile,
         conflict_behavior: str = "fail",
-    ) -> UploadResult: ...
+    ) -> UploadFileResult: ...
+    async def upload_large_file(
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        local_file: LocalFile,
+        conflict_behavior: str = "fail",
+    ) -> UploadResult[DriveItem]: ...
 ```
 
 ## Exemplo Completo de Uso
@@ -410,7 +416,7 @@ async def main() -> None:
             ("datasets", "2026", "06", "04"),
         )
 
-        local_file = LocalFile.from_path("/tmp/relatorio.csv")
+        local_file = LocalFile.from_uri("/tmp/relatorio.csv")
         result = await sharepoint.upload_small_file(
             drive,
             target,
@@ -448,6 +454,75 @@ asyncio.run(main())
   - `fail` levanta erro;
   - `rename` cria com novo nome;
   - `replace` substitui o conteudo do item existente.
+
+### Upload grande
+
+O fluxo atual:
+
+1. valida o item pai e o arquivo local;
+2. cria uma `UploadSession` por path remoto;
+3. abre o arquivo como stream binario;
+4. usa `LargeFileUploadTask` para enviar chunks;
+5. devolve `UploadResult[DriveItem]` do SDK.
+
+Exemplo atual:
+
+```python
+local_file = LocalFile.from_uri("/tmp/backup.zip")
+
+sdk_result = await sharepoint.upload_large_file(
+    drive,
+    root,
+    local_file,
+    conflict_behavior="rename",
+)
+```
+
+O quinto passo deve mudar na fase 2: o retorno publico esperado passa a ser
+`UploadFileResult`, contendo um `DriveItemRef`.
+
+## Especificacao da Fase 2
+
+A fase 2 deve criar uma fronteira publica independente do SDK.
+
+### Obrigacoes
+
+- nenhum metodo publico deve exigir um model gerado pelo Graph;
+- nenhum metodo publico deve retornar um model do Graph ou do `msgraph-core`;
+- request bodies gerados devem ser construidos em builders internos;
+- respostas do SDK devem passar por parsers ou factories;
+- excecoes externas devem ser convertidas para erros semanticos;
+- wrappers de comportamento devem esconder tasks e request adapters;
+- tipos compartilhados, como conflito e resultado, devem ter uma unica
+  definicao no Core.
+
+### Fluxo desejado do upload grande
+
+```text
+LocalFile + DriveRef + DriveItemRef
+  -> LargeFileUploadRequest
+  -> wrapper/executor interno
+  -> UploadSession do SDK
+  -> LargeFileUploadTask do SDK
+  -> UploadResult[DriveItem] do SDK
+  -> factory/parser
+  -> UploadFileResult
+```
+
+### Exemplo publico desejado
+
+```python
+result = await sharepoint.upload_large_file(
+    drive,
+    root,
+    LocalFile.from_uri("/tmp/backup.zip"),
+    conflict_behavior="rename",
+)
+
+print(result.item.id)
+print(result.remote_name)
+print(result.source_path)
+```
 
 ## Erros Semanticos
 
@@ -501,13 +576,16 @@ GET /drives/{drive-id}/items/{item-id}/children
 POST /drives/{drive-id}/items/{item-id}/children
 PUT /drives/{drive-id}/items/{item-id}:/{filename}:/content
 PUT /drives/{drive-id}/items/{item-id}/content
+POST /drives/{drive-id}/items/{parent-id}:/{filename}:/createUploadSession
 ```
 
 ## Proximos Passos
 
 As implementacoes de maior prioridade agora sao:
 
-1. upload grande por upload session;
-2. leitura e mapeamento de diretorios locais;
-3. upload recursivo de arvores locais;
-4. consolidacao do fluxo de alto nivel de sincronizacao.
+1. definir erros semanticos do upload grande;
+2. criar wrappers para sessao e executor de chunks;
+3. criar factory/parser de resultado para `UploadFileResult`;
+4. remover tipos do SDK das assinaturas publicas;
+5. ler e mapear diretorios locais;
+6. enviar arvores locais recursivamente.

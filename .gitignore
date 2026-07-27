@@ -12,3 +12,8 @@ venv/*
 # Ignorando .vscode
 
 .vscode/
+
+
+# Ignorando chace do ruff
+.ruff_cache
+

@@ -13,19 +13,18 @@ Exemplo:
 from __future__ import annotations
 
 from collections.abc import Sequence
-
+from types import TracebackType
+from typing import Self
 from azure.identity.aio import ClientSecretCredential
 from msgraph.graph_service_client import GraphServiceClient
 
 from core.models import GraphCredentials
 
-
 DEFAULT_SCOPES: tuple[str, ...] = ("https://graph.microsoft.com/.default",)
 
 
 class GraphClientManager:
-    """
-    Responsavel por criar e fechar o ciclo de vida do GraphServiceClient.
+    """Responsavel por criar e fechar o ciclo de vida do GraphServiceClient.
 
     Esta classe nao le variaveis de ambiente. Ela recebe um objeto de
     credenciais ja resolvido por outra camada e controla a vida util da
@@ -59,34 +58,39 @@ class GraphClientManager:
 
     @property
     def credential(self) -> ClientSecretCredential:
-        '''Retorna a credencial assíncrona usada pelo client Graph.'''
+        """Retorna a credencial assíncrona usada pelo client Graph."""
         return self._credential
 
     @property
     def client(self) -> GraphServiceClient:
-        '''Retorna o `GraphServiceClient` enquanto o manager estiver aberto.'''
+        """Retorna o `GraphServiceClient` enquanto o manager estiver aberto."""
         if self._closed:
             raise RuntimeError("Graph client manager is closed.")
         return self._client
 
     @property
     def scopes(self) -> tuple[str, ...]:
-        '''Retorna os scopes configurados para autenticacao no Graph.'''
+        """Retorna os scopes configurados para autenticacao no Graph."""
         return self._scopes
 
     async def close(self) -> None:
-        '''Fecha a credencial subjacente usada pelo client Graph.'''
+        """Fecha a credencial subjacente usada pelo client Graph."""
         if self._closed:
             return
         await self._credential.close()
         self._closed = True
 
     async def __aenter__(self) -> GraphClientManager:
-        '''Permite usar o manager com `async with`.'''
+        """Permite usar o manager com `async with`."""
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        '''Garante fechamento da credencial ao sair do contexto assincrono.'''
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """Garante fechamento da credencial ao sair do contexto assincrono."""
         await self.close()
 
     @staticmethod

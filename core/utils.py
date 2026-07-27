@@ -18,9 +18,9 @@ def rename_with_uuid(name: str) -> str:
     # O nome e tratado como path puro apenas para separar stem e extensoes sem
     # tocar no sistema de arquivos local.
     path = PurePath(name)
-    suffix = ''.join(path.suffixes)
-    stem = path.name[:-len(suffix)] if suffix else path.name
+    suffix = "".join(path.suffixes)
+    stem = path.name[: -len(suffix)] if suffix else path.name
 
     if not stem:
-        return f'{id}{suffix}'
-    return f'{stem}-{id}{suffix}'
+        return f"{id}{suffix}"
+    return f"{stem}-{id}{suffix}"

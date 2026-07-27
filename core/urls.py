@@ -1,7 +1,7 @@
 """Helpers para validar URLs humanas do SharePoint e montar rotas Graph.
 
-Este modulo lida apenas com strings de URL. Ele nao chama o Graph e nao valida se
-o site existe; essa responsabilidade pertence ao `SharePointService`.
+Este modulo lida apenas com strings de URL. Ele nao chama o Graph nem valida
+se o site existe; essa responsabilidade pertence ao `SharePointService`.
 
 Exemplo:
     graph_url = build_graph_site_url(
@@ -15,8 +15,7 @@ from core.errors import SharePointUrlError
 
 
 def validate_graph_url(url: str, strict_validate: bool = False) -> bool:
-    """
-    Valida a forma minima de uma URL usada pelo Core.
+    """Valida a forma minima de uma URL usada pelo Core.
 
     No modo padrao, valida apenas se a URL:
     - nao e vazia;
@@ -33,7 +32,7 @@ def validate_graph_url(url: str, strict_validate: bool = False) -> bool:
     parts = urlparse(url)
 
     # O Core exige HTTPS para URLs humanas do SharePoint.
-    if parts.scheme != 'https':
+    if parts.scheme != "https":
         return False
 
     # Sem hostname nao ha tenant SharePoint para resolver.
@@ -44,7 +43,7 @@ def validate_graph_url(url: str, strict_validate: bool = False) -> bool:
         # No modo estrito, exigimos path explicito de site.
         if not parts.path:
             return False
-        paths_fragments = parts.path.split(':')
+        paths_fragments = parts.path.split(":")
         # Paths com mais de um fragmento separado por ':' geralmente indicam
         # que a URL ja aponta para um sub-recurso Graph.
         if len(paths_fragments) > 1:
@@ -56,13 +55,13 @@ def validate_graph_url(url: str, strict_validate: bool = False) -> bool:
 
 
 def build_graph_site_url(sharepoint_url: str, strict_validate: bool = False) -> str:
-    """
-    Converte uma URL humana do SharePoint na URL Graph usada para resolver um
-    site.
+    """Converte uma URL humana do SharePoint na URL Graph usada para resolver
+    um site.
 
     Exemplo:
         https://tenant.sharepoint.com/sites/RHConecta
-        -> https://graph.microsoft.com/v1.0/sites/tenant.sharepoint.com:/sites/RHConecta
+        -> https://graph.microsoft.com/v1.0/sites/
+           tenant.sharepoint.com:/sites/RHConecta
 
     Quando a validacao falha, a funcao levanta SharePointUrlError para que a
     camada de servico nao precise conhecer detalhes do parse.
@@ -76,9 +75,11 @@ def build_graph_site_url(sharepoint_url: str, strict_validate: bool = False) -> 
     # Sem path, a URL aponta para o site raiz do tenant e o Graph aceita apenas
     # o hostname como alvo de resolucao.
     if not parts.path:
-        return f'https://graph.microsoft.com/v1.0/sites/{parts.hostname}'.rstrip('/')
+        return f"https://graph.microsoft.com/v1.0/sites/{parts.hostname}".rstrip("/")
     # Com path, o Graph exige a sintaxe `hostname:/server-relative-path`.
-    return f'https://graph.microsoft.com/v1.0/sites/{parts.hostname}:{parts.path}'.rstrip('/')
+    return f"https://graph.microsoft.com/v1.0/sites/{parts.hostname}:{
+        parts.path
+    }".rstrip("/")
 
 
 def build_create_content_url(filename: str) -> str:
@@ -87,7 +88,7 @@ def build_create_content_url(filename: str) -> str:
     O retorno e apenas o sufixo relativo ao item pai, por exemplo
     `:/curriculo.pdf:/content`.
     """
-    return f':/{filename}:/content'
+    return f":/{filename}:/content"
 
 
 def build_drive_create_content_url(
@@ -101,6 +102,6 @@ def build_drive_create_content_url(
     exemplo `:/curriculo.pdf:/content`.
     """
     return (
-        f'https://graph.microsoft.com/v1.0/drives/{drive_id}'
-        f'/items/{parent_item_id}{target_path}'
+        f"https://graph.microsoft.com/v1.0/drives/{drive_id}"
+        f"/items/{parent_item_id}{target_path}"
     )

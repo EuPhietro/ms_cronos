@@ -1,39 +1,17 @@
-"""
-Superficie publica do pacote ``core``.
+"""Superficie publica do pacote ``core``.
 
 Este modulo reexporta os simbolos que formam a API interna do Core para que as
 demais camadas possam fazer imports simples do tipo ``from core import X``.
 
 Regra pratica:
-    Importe daqui quando estiver consumindo o Core. Importe dos submodulos apenas
-    quando estiver trabalhando dentro da propria implementacao do Core.
+    Importe daqui quando estiver consumindo o Core. Importe dos submodulos
+    apenas ao trabalhar dentro da propria implementacao do Core.
 """
 
 # Modelos e colecoes formam o contrato de dados mais basico do Core.
-from core.models import (
-    Collection_,
-    DriveItemCollection,
-    DriveItemRef,
-    DriveRef,
-    DriveRefCollection,
-    FrozenCollection,
-    GraphCredentials,
-    LocalFile,
-    StagingContentUpload,
-    LocalFileCollection,
-    MutableCollection,
-    SiteRef,
-    SiteRefCollection,
-    UploadResult,
-)
-
-# Integracao com o Microsoft Graph: criacao do client e ciclo de vida da
-# credencial assincrona.
-from core.graph_client import (
-    GraphClientManager,
-    create_graph_client,
-    create_graph_client_manager,
-)
+# Builders montam staging e bodies do SDK sem expor essa montagem ao servico.
+from core.builders import build_folder_drive_item as build_folder_drive_item
+from core.builders import build_upload_content as build_upload_content
 
 # Erros publicos do Core, reexportados para que outras camadas nao precisem
 # conhecer a estrutura interna de modulos.
@@ -42,8 +20,9 @@ from core.errors import (
     DriveItemNotFoundError,
     DriveNotFoundError,
     FailedWhenCreateDriveItemError,
-    FolderNotFoundError,
+    FileAlreadyExistError,
     FileVeryLargeError,
+    FolderNotFoundError,
     GraphAuthenticationError,
     GraphConfigurationError,
     GraphPermissionError,
@@ -58,6 +37,7 @@ from core.errors import (
     LocalPathError,
     LocalPathIsDirectoryError,
     LocalPathNotFoundError,
+    NotAChildError,
     NotAFileError,
     NotAFolderError,
     SharePointUrlError,
@@ -66,10 +46,34 @@ from core.errors import (
     UploadChunkError,
     UploadError,
     UploadSessionCreationError,
-    NotAChildError,
-    FileAlreadyExistError
 )
 
+# Integracao com o Microsoft Graph: criacao do client e ciclo de vida da
+# credencial assincrona.
+from core.graph_client import (
+    GraphClientManager,
+    create_graph_client,
+    create_graph_client_manager,
+)
+from core.models import (
+    Collection_,
+    CollectionItem,
+    ConflictBehavior,
+    DocumentLibrary,
+    DocumentLibraryCollection,
+    FileUploadResult,
+    FrozenCollection,
+    GraphCredentials,
+    LocalFile,
+    LocalFileCollection,
+    MutableCollection,
+    PreparedUpload,
+    PreparedUploadCollection,
+    SharePointItem,
+    SharePointItemCollection,
+    SharePointSite,
+    SharePointSiteCollection,
+)
 from core.parse import (
     adapt_site,
     parse_drive,
@@ -82,18 +86,15 @@ from core.parse import (
     parse_site_collection_response,
 )
 
-# Helpers de URL usados para validar entradas e montar rotas especiais do Graph.
+# O servico concentra as regras de navegacao, criacao e upload sobre o client.
+from core.sharepoint import SharePointService
+
+# Helpers de URL usados para validar entradas e montar rotas especiais do
+# Graph.
 from core.urls import (
     build_create_content_url,
     build_drive_create_content_url,
     build_graph_site_url,
     validate_graph_url,
 )
-
-# Builders montam staging e bodies do SDK sem expor essa montagem ao servico.
-from core.builders import build_folder_drive_item, build_upload_content
-
-# O servico concentra as regras de navegacao, criacao e upload sobre o client.
-from core.sharepoint import SharePointService
-
 from core.utils import rename_with_uuid

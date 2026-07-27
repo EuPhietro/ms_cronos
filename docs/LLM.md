@@ -8,9 +8,9 @@ e assistentes de codigo.
 - linguagem principal: Python;
 - dominio atual: SharePoint + Microsoft Graph;
 - camada principal implementada: `core/`;
-- objetivo atual: navegar por sites e drives, criar pastas remotas e enviar
-  arquivos pequenos;
-- objetivo futuro: upload de diretorios locais complexos.
+- objetivo atual: abstrair o SDK depois de validar navegacao e uploads pequeno
+  e grande;
+- objetivo futuro: API reutilizavel e upload de diretorios locais complexos.
 
 ## O Que Ja Existe
 
@@ -27,12 +27,15 @@ O Core ja implementa:
 - criacao de pasta remota;
 - garantia de caminho remoto;
 - upload pequeno com conflito `fail`, `rename` ou `replace`;
+- upload grande com upload session e chunks;
 - parse de models do SDK para models internos;
 - traducao inicial de `ODataError`.
 
 Ainda faltam:
 
-- upload grande por upload session;
+- wrappers para os novos tipos do SDK;
+- factory/parser para o resultado do upload grande;
+- erros semanticos do novo fluxo;
 - leitura recursiva de arvore local;
 - upload completo de diretorios.
 
@@ -114,7 +117,7 @@ Contem:
 - `DriveItemRef`
 - `LocalFile`
 - `StagingContentUpload`
-- `UploadResult`
+- `UploadFileResult`
 - colecoes genericas e colecoes concretas
 
 Use este modulo quando a tarefa envolver:
@@ -214,6 +217,7 @@ O `SharePointService` hoje expoe principalmente:
 - `create_folder(...)`
 - `ensure_remote_folder_path(...)`
 - `upload_small_file(...)`
+- `upload_large_file(...)`
 
 ## Exemplo Minimo
 
@@ -246,7 +250,7 @@ async def main() -> None:
             ("datasets", "2026", "06"),
         )
 
-        local_file = LocalFile.from_path("/tmp/relatorio.csv")
+        local_file = LocalFile.from_uri("/tmp/relatorio.csv")
         result = await sharepoint.upload_small_file(
             drive,
             target,
@@ -274,6 +278,32 @@ asyncio.run(main())
 - `fail` levanta erro se o nome remoto ja existir;
 - `rename` gera novo nome preservando extensao;
 - `replace` substitui o conteudo do arquivo existente.
+
+### Upload grande
+
+- cria uma upload session por path remoto;
+- envia o stream por `LargeFileUploadTask`;
+- usa `MAX_CHUNK_SIZE` como limite de cada trecho;
+- ainda retorna `UploadResult[DriveItem]` do SDK.
+
+## Direcao da Fase 2
+
+A API publica deve aceitar e devolver apenas tipos do MS Cronos.
+
+```text
+public API -> internal wrappers/adapters -> Graph SDK
+```
+
+Tipos do SDK atualmente visiveis no fluxo grande:
+
+- `DriveItem`
+- `DriveItemUploadableProperties`
+- `UploadSession`
+- `UploadResult`
+- `CreateUploadSessionPostRequestBody`
+- `LargeFileUploadTask`
+
+Esses tipos devem ficar restritos aos builders, parsers e wrappers internos.
 
 ### Erros
 

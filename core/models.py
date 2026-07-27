@@ -16,14 +16,14 @@ Exemplo basico:
         tenant_id="tenant-id",
     )
 
-    site = SiteRef(
+    site = SharePointSite(
         id="tenant.sharepoint.com,site-guid,web-guid",
         name="RHConecta",
         display_name="RH Conecta",
         web_url="https://tenant.sharepoint.com/sites/RHConecta",
     )
 
-    sites = SiteRefCollection.from_collection([site])
+    sites = SharePointSiteCollection.from_collection([site])
     assert not sites.is_empty
     assert sites.first() == site
 """
@@ -31,43 +31,41 @@ Exemplo basico:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
-    Callable,
     ClassVar,
     Generic,
-    Iterator,
-    List,
     Literal,
-    Optional,
     Self,
     TypeVar,
     cast,
+    overload,
 )
 
-
 # `T` representa o tipo de item armazenado por uma colecao generica.
-T = TypeVar('T')
+T = TypeVar("T")
+
+# Politica de conflito aceita pelas operacoes de criacao e upload.
+ConflictBehavior = Literal["fail", "rename", "replace"]
 
 
 # `CollectionItem` permanece como classe base semantica para identificar os
 # modelos que podem viver dentro das colecoes do Core.
-class CollectionItem(Generic[T], ABC):
+class CollectionItem(ABC):
     """Marcador semantico para itens que circulam nas colecoes do Core.
 
-    A classe nao adiciona comportamento por enquanto. Ela existe para deixar claro
-    que `SiteRef`, `DriveRef`, `DriveItemRef`, `LocalFile` e `UploadResult` sao
-    modelos internos do Core e podem ser agrupados por colecoes semanticas.
+    A classe nao adiciona comportamento por enquanto. Ela existe para deixar
+    claro que `SharePointSite`, `DocumentLibrary`, `SharePointItem`, `LocalFile` e
+    `FileUploadResult` sao modelos internos do Core e podem ser agrupados por
+    colecoes semanticas.
     """
-
-    ...
 
 
 @dataclass(frozen=True)
 class GraphCredentials:
-    '''
+    """
     Contrato de entrada das credenciais usadas para autenticar no Graph.
 
     Exemplo:
@@ -76,7 +74,7 @@ class GraphCredentials:
             client_secret='secret',
             tenant_id='tenant-id',
         )
-    '''
+    """
 
     client_id: str
     client_secret: str
@@ -84,51 +82,52 @@ class GraphCredentials:
 
 
 @dataclass(frozen=True)
-class SiteRef(CollectionItem):
-    '''
+class SharePointSite(CollectionItem):
+    """
     Referencia enxuta de um site do SharePoint resolvido pelo Core.
 
     Exemplo:
-        site = SiteRef(
+        site = SharePointSite(
             id='tenant.sharepoint.com,site-guid,web-guid',
             name='RHConecta',
             display_name='RH Conecta',
             web_url='https://tenant.sharepoint.com/sites/RHConecta',
         )
-    '''
+    """
+
     id: str
-    name: str | None
-    display_name: str | None
-    web_url: str | None
+    name: str | None = None
+    display_name: str | None = None
+    web_url: str | None = None
 
 
 @dataclass(frozen=True)
-class DriveRef(CollectionItem):
-    '''
+class DocumentLibrary(CollectionItem):
+    """
     Referencia enxuta de um drive do SharePoint.
 
     Exemplo:
-        drive = DriveRef(
+        drive = DocumentLibrary(
             id='b!abc123',
             name='Documents',
             web_url='https://tenant.sharepoint.com/sites/RHConecta/Shared%20Documents',
             drive_type='documentLibrary',
         )
-    '''
+    """
 
     id: str
-    name: str | None
-    web_url: str | None
-    drive_type: str | None
+    name: str | None = None
+    web_url: str | None = None
+    drive_type: str | None = None
 
 
 @dataclass(frozen=True)
-class DriveItemRef(CollectionItem):
-    '''
+class SharePointItem(CollectionItem):
+    """
     Referencia enxuta de um item de drive, seja arquivo ou pasta.
 
     Exemplo:
-        item = DriveItemRef(
+        item = SharePointItem(
             id='01ABCDEF',
             name='Curriculos',
             web_url='https://tenant.sharepoint.com/sites/RHConecta/Shared%20Documents/Curriculos',
@@ -136,37 +135,37 @@ class DriveItemRef(CollectionItem):
             is_file=False,
             size=0,
         )
-    '''
+    """
 
     id: str
-    name: str | None
-    web_url: str | None
-    is_folder: bool
-    is_file: bool
-    size: int | None
+    name: str | None = None
+    web_url: str | None = None
+    is_folder: bool = False
+    is_file: bool = False
+    size: int | None = None
 
 
 @dataclass(frozen=True)
 class LocalFile(CollectionItem):
-    '''
+    """
     Modelo semantico para um arquivo local que pode ser enviado ao SharePoint.
 
     Exemplo:
-        local_file = LocalFile.from_path('/tmp/curriculo.pdf')
-    '''
+        local_file = LocalFile.from_uri('/tmp/curriculo.pdf')
+    """
 
     path: Path
     name: str
-    extension: str | None
-    size: int | None
- 
+    extension: str | None = None
+    size: int | None = None
+
     @classmethod
-    def from_path(cls, path: str | Path) -> 'LocalFile':
-        """Cria um `LocalFile` a partir de `str` ou `Path`.
+    def from_uri(cls, path: str | Path) -> LocalFile:
+        """Cria um `LocalFile` a partir de um caminho local `str` ou `Path`.
 
         Este construtor e permissivo: se o caminho ainda nao existir, `size`
-        permanece `None`. Validacoes mais rigidas ficam no parser ou no fluxo de
-        upload.
+        permanece `None`. Validacoes mais rigidas ficam no parser ou no fluxo
+        de upload.
         """
         resolved_path = Path(path)
         suffix = resolved_path.suffix or None
@@ -178,12 +177,13 @@ class LocalFile(CollectionItem):
         )
 
     def rename(self, name: str) -> Self:
-        """Retorna uma nova referencia local com outro nome sem mover o arquivo."""
+        """Retorna uma nova referencia local com outro nome sem mover o
+        arquivo."""
         return type(self)(self.path, name, self.extension, self.size)
 
 
 @dataclass(frozen=True)
-class StagingContentUpload(CollectionItem):
+class PreparedUpload(CollectionItem):
     """Representa um upload pequeno ja preparado para envio.
 
     O objeto guarda:
@@ -191,27 +191,29 @@ class StagingContentUpload(CollectionItem):
     - o fragmento de path Graph que identifica o recurso de criacao;
     - a estrategia semantica de conflito pedida pelo chamador.
     """
+
     file: LocalFile
     target_path: str
-    conflict_behavior: Literal['fail', 'rename', 'replace'] = 'fail'
+    conflict_behavior: ConflictBehavior = "fail"
+
 
 @dataclass(frozen=True)
-class UploadResult(CollectionItem):
-    '''Representa o resultado semantico de um upload concluido.
+class FileUploadResult(CollectionItem):
+    """Representa o resultado semantico de um upload concluido.
 
     Exemplo:
-        result = UploadResult(
+        result = FileUploadResult(
             item=drive_item,
             source_path=Path('/tmp/curriculo.pdf'),
             remote_name='curriculo.pdf',
             conflict_behavior='replace',
         )
-    '''
+    """
 
-    item: DriveItemRef
+    item: SharePointItem
     source_path: Path
     remote_name: str
-    conflict_behavior: str
+    conflict_behavior: ConflictBehavior
 
 
 class Collection_(Generic[T], ABC):
@@ -244,46 +246,52 @@ class Collection_(Generic[T], ABC):
 
     @property
     def counter(self) -> int:
-        '''Retorna a quantidade de itens armazenados.'''
+        """Retorna a quantidade de itens armazenados."""
         return len(self._slots)
 
     @property
     def is_empty(self) -> bool:
-        '''Indica se a colecao nao possui itens.'''
+        """Indica se a colecao nao possui itens."""
         return len(self._slots) == 0
 
-    def first(self) -> Optional[T]:
-        '''Retorna o primeiro item ou `None` quando a colecao estiver vazia.'''
+    def first(self) -> T | None:
+        """Retorna o primeiro item ou `None` quando a colecao estiver vazia."""
         return self._slots[0] if not self.is_empty else None
 
-    def to_list(self) -> List[T]:
-        '''Devolve uma copia rasa da colecao como lista comum do Python.'''
+    def to_list(self) -> list[T]:
+        """Devolve uma copia rasa da colecao como lista comum do Python."""
         return list(self._slots)
 
     def __iter__(self) -> Iterator[T]:
-        '''Permite iterar diretamente sobre a colecao.'''
+        """Permite iterar diretamente sobre a colecao."""
         return self._slots.__iter__()
 
     def __len__(self) -> int:
-        '''Permite usar `len(colecao)`.'''
+        """Permite usar `len(colecao)`."""
         return len(self._slots)
 
     def __bool__(self) -> bool:
-        '''Colecoes vazias sao avaliadas como `False`.'''
+        """Colecoes vazias sao avaliadas como `False`."""
         return not self.is_empty
 
-    def __getitem__(self, key):
-        '''Permite acessar itens por indice ou slice.'''
+    @overload
+    def __getitem__(self, key: int) -> T: ...
+
+    @overload
+    def __getitem__(self, key: slice) -> Sequence[T]: ...
+
+    def __getitem__(self, key: int | slice) -> T | Sequence[T]:
+        """Permite acessar itens por indice ou slice."""
         return self._slots[key]
 
     def __contains__(self, item: object) -> bool:
-        '''Permite testar pertinencia com o operador `in`.'''
+        """Permite testar pertinencia com o operador `in`."""
         return item in self._slots
 
 
 @dataclass(frozen=True)
 class FrozenCollection(Collection_[T]):
-    '''
+    """
     Colecao imutavel usada como contrato publico de retorno do Core.
 
     Toda operacao que alteraria o conteudo devolve uma nova instancia em vez de
@@ -294,9 +302,13 @@ class FrozenCollection(Collection_[T]):
         updated = drives.add('Curriculos')
         assert drives.counter == 1
         assert updated.counter == 2
-    '''
+    """
+
     _storage_factory = tuple
-    _slots: tuple[T, ...] = field(default_factory=tuple, init=True)
+    _slots: tuple[T, ...] = field(  # pyright: ignore[reportIncompatibleVariableOverride]
+        default_factory=tuple,
+        init=True,
+    )
 
     @classmethod
     def from_collection(cls, collection: Sequence[T]) -> Self:
@@ -305,21 +317,20 @@ class FrozenCollection(Collection_[T]):
             return cls()
         _slots_ = cast(tuple[T, ...], cls._storage_factory(collection))
         return cls(_slots=_slots_)
-    
 
     def add(self, item: T) -> Self:
-        '''Retorna uma nova colecao contendo o item informado ao final.'''
+        """Retorna uma nova colecao contendo o item informado ao final."""
         _new_slots: tuple[T, ...] = (*self._slots, item)
         return type(self).from_collection(_new_slots)
 
     def extend(self, *items: T) -> Self:
-        '''Retorna uma nova colecao contendo os itens atuais e os novos.'''
+        """Retorna uma nova colecao contendo os itens atuais e os novos."""
         _new_slots: tuple[T, ...] = (*self._slots, *items)
 
         return type(self).from_collection(_new_slots)
 
     def remove(self, item: T) -> Self:
-        '''Retorna uma nova colecao sem a primeira ocorrencia do item.'''
+        """Retorna uma nova colecao sem a primeira ocorrencia do item."""
         updated_slots = list(self._slots)
         updated_slots.remove(item)
         _new_slots: tuple[T, ...] = tuple(updated_slots)
@@ -327,21 +338,24 @@ class FrozenCollection(Collection_[T]):
         return type(self).from_collection(_new_slots)
 
     def clear(self) -> Self:
-        '''Retorna uma nova colecao vazia do mesmo tipo.'''
+        """Retorna uma nova colecao vazia do mesmo tipo."""
         return type(self).from_collection(())
 
 
 @dataclass
 class MutableCollection(Collection_[T]):
-    '''Colecao editavel usada em cenarios de montagem e transformacao.
+    """Colecao editavel usada em cenarios de montagem e transformacao.
 
     Exemplo:
         files = MutableCollection(_slots=['a.txt'])
         files.add('b.txt')
         assert files.counter == 2
-    '''
+    """
+
     _storage_factory = list
-    _slots: list[T] = field(default_factory=list)
+    _slots: list[T] = field(  # pyright: ignore[reportIncompatibleVariableOverride]
+        default_factory=list,
+    )
 
     @classmethod
     def from_collection(cls, collection: Sequence[T]) -> Self:
@@ -353,77 +367,69 @@ class MutableCollection(Collection_[T]):
         return cls(_slots=_slots_)
 
     def add(self, item: T) -> None:
-        '''Adiciona um item ao final da colecao atual.'''
+        """Adiciona um item ao final da colecao atual."""
         self._slots.append(item)
 
     def extend(self, *items: T) -> None:
-        '''Adiciona varios itens ao final da colecao atual.'''
+        """Adiciona varios itens ao final da colecao atual."""
         self._slots.extend(items)
 
     def remove(self, item: T) -> None:
-        '''Remove a primeira ocorrencia do item informado.'''
+        """Remove a primeira ocorrencia do item informado."""
         self._slots.remove(item)
 
     def clear(self) -> None:
-        '''Remove todos os itens da colecao atual.'''
+        """Remove todos os itens da colecao atual."""
         self._slots.clear()
 
 
 @dataclass(frozen=True)
-class SiteRefCollection(FrozenCollection[SiteRef]):
-    '''Colecao imutavel de referencias de sites resolvidos pelo Core.
+class SharePointSiteCollection(FrozenCollection[SharePointSite]):
+    """Colecao imutavel de referencias de sites resolvidos pelo Core.
 
     Exemplo:
-        sites = SiteRefCollection(_slots=(site_ref,))
+        sites = SharePointSiteCollection(_slots=(site_ref,))
         first_site = sites.first()
-    '''
-
-    pass
+    """
 
 
 @dataclass(frozen=True)
-class DriveRefCollection(FrozenCollection[DriveRef]):
-    '''Colecao imutavel de referencias de drives do SharePoint.
+class DocumentLibraryCollection(FrozenCollection[DocumentLibrary]):
+    """Colecao imutavel de referencias de drives do SharePoint.
 
     Exemplo:
-        drives = DriveRefCollection(_slots=(drive_ref,))
+        drives = DocumentLibraryCollection(_slots=(drive_ref,))
         assert drives.counter == 1
-    '''
-
-    pass
+    """
 
 
 @dataclass(frozen=True)
-class DriveItemCollection(FrozenCollection[DriveItemRef]):
-    '''Colecao imutavel de arquivos e pastas retornados de um drive.
+class SharePointItemCollection(FrozenCollection[SharePointItem]):
+    """Colecao imutavel de arquivos e pastas retornados de um drive.
 
     Exemplo:
-        items = DriveItemCollection(_slots=(drive_item_ref,))
+        items = SharePointItemCollection(_slots=(drive_item_ref,))
         assert drive_item_ref in items
-    '''
-
-    pass
+    """
 
 
 @dataclass
 class LocalFileCollection(MutableCollection[LocalFile]):
-    '''Colecao mutavel de arquivos locais preparados para processamento.
+    """Colecao mutavel de arquivos locais preparados para processamento.
 
     Exemplo:
         files = LocalFileCollection(_slots=[local_file])
         files.clear()
         assert files.is_empty
-    '''
+    """
 
-    pass
 
-@dataclass 
-class StagingUpdateContentCollection(MutableCollection[StagingContentUpload]):
-    '''Colecao mutavel de uploads pequenos ja preparados para envio.
+@dataclass
+class PreparedUploadCollection(MutableCollection[PreparedUpload]):
+    """Colecao mutavel de uploads pequenos ja preparados para envio.
 
     Exemplo:
-        staged = StagingUpdateContentCollection(_slots=[staging_content])
+        staged = PreparedUploadCollection(_slots=[staging_content])
         staged.clear()
         assert staged.is_empty
-    '''
-    pass
+    """

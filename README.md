@@ -42,12 +42,15 @@ O Core ja implementa:
 - criacao de pasta remota;
 - garantia incremental de caminho remoto;
 - upload pequeno com `conflict_behavior`;
+- upload grande com upload session e envio por chunks;
 - parse de models do SDK para models internos;
 - traducao inicial de `ODataError` para erros semanticos do Core.
 
 Ainda faltam principalmente:
 
-- upload de arquivos grandes com upload session;
+- adaptar o resultado do upload grande para um model interno;
+- encapsular os models, request bodies e tasks usados diretamente do SDK;
+- aplicar erros semanticos ao fluxo de upload grande;
 - leitura e mapeamento de arvores locais;
 - upload completo de diretorios locais complexos.
 
@@ -156,7 +159,7 @@ async def main() -> None:
             ("datasets", "2026", "06", "04"),
         )
 
-        local_file = LocalFile.from_path("/tmp/relatorio.csv")
+        local_file = LocalFile.from_uri("/tmp/relatorio.csv")
 
         result = await sharepoint.upload_small_file(
             drive,
@@ -180,9 +183,7 @@ if __name__ == "__main__":
 ### Resolver um site
 
 ```python
-site = await sharepoint.resolve_site(
-    "https://tenant.sharepoint.com/sites/RHConecta"
-)
+site = await sharepoint.resolve_site("https://tenant.sharepoint.com/sites/RHConecta")
 
 print(site.id)
 print(site.web_url)
@@ -259,7 +260,7 @@ print(leaf.name)
 ### Upload pequeno
 
 ```python
-local_file = LocalFile.from_path("/tmp/relatorio.pdf")
+local_file = LocalFile.from_uri("/tmp/relatorio.pdf")
 
 result = await sharepoint.upload_small_file(
     drive,
@@ -280,6 +281,26 @@ print(result.item.id)
 
 O fluxo de upload pequeno atualmente rejeita arquivos acima de `250_000_000`
 bytes.
+
+### Upload grande
+
+```python
+local_file = LocalFile.from_uri("/tmp/backup.zip")
+
+sdk_result = await sharepoint.upload_large_file(
+    drive,
+    root,
+    local_file,
+    conflict_behavior="rename",
+)
+
+print(sdk_result.upload_succeeded)
+print(sdk_result.item_response)
+```
+
+O fluxo cria uma upload session e delega o envio parcial ao
+`LargeFileUploadTask`. Atualmente ele ainda retorna o `UploadResult[DriveItem]`
+do SDK; essa e uma fronteira temporaria da fase 1.
 
 ## Colecoes do Core
 
@@ -307,7 +328,7 @@ Contem:
 - colecoes genericas como `Collection_`, `FrozenCollection`, `MutableCollection`;
 - colecoes concretas como `SiteRefCollection`, `DriveRefCollection`,
   `DriveItemCollection` e `LocalFileCollection`;
-- contratos de upload como `StagingContentUpload` e `UploadResult`.
+- contratos de upload como `StagingContentUpload` e `UploadFileResult`.
 
 ### `core/graph_client.py`
 
@@ -413,7 +434,14 @@ class SharePointService:
         parent_item_ref: DriveItemRef,
         local_file: LocalFile,
         conflict_behavior: str = "fail",
-    ) -> UploadResult: ...
+    ) -> UploadFileResult: ...
+    async def upload_large_file(
+        self,
+        drive_ref: DriveRef,
+        parent_item_ref: DriveItemRef,
+        local_file: LocalFile,
+        conflict_behavior: str = "fail",
+    ) -> UploadResult[DriveItem]: ...
 ```
 
 ## Rotas Mais Importantes do Graph
@@ -428,7 +456,40 @@ GET /drives/{drive-id}/items/{item-id}/children
 POST /drives/{drive-id}/items/{item-id}/children
 PUT /drives/{drive-id}/items/{item-id}:/{filename}:/content
 PUT /drives/{drive-id}/items/{item-id}/content
+POST /drives/{drive-id}/items/{parent-id}:/{filename}:/createUploadSession
 ```
+
+## Fase 2: Abstracao do SDK
+
+O objetivo da fase 2 e impedir que projetos consumidores precisem importar ou
+entender classes geradas pelo Microsoft Graph.
+
+Fronteira desejada:
+
+```text
+Projeto consumidor
+  -> models, erros e servicos do MS Cronos
+  -> adapters, builders e wrappers internos
+  -> Microsoft Graph SDK
+```
+
+Exemplo do contrato final desejado:
+
+```python
+result: UploadFileResult = await sharepoint.upload_large_file(
+    drive,
+    root,
+    local_file,
+    conflict_behavior="rename",
+)
+
+print(result.item.id)
+print(result.remote_name)
+```
+
+Classes como `DriveItem`, `UploadSession`, `UploadResult`,
+`DriveItemUploadableProperties`, `CreateUploadSessionPostRequestBody` e
+`LargeFileUploadTask` devem permanecer dentro da camada de integracao.
 
 ## Uso Atual do Repositorio
 
