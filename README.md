@@ -1,514 +1,391 @@
 # MS Cronos
 
-MS Cronos e um projeto Python para navegacao e upload de conteudo local para
-bibliotecas de documentos do SharePoint via Microsoft Graph.
+MS Cronos e um wrapper Python assincrono para navegacao e upload de arquivos em
+bibliotecas de documentos do SharePoint por meio do Microsoft Graph.
 
-O foco atual esta no `core/`: uma camada pequena, tipada e semantica que
-esconde a verbosidade do SDK oficial e expoe operacoes previsiveis sobre site,
-drive, pasta e arquivo.
+O projeto oferece modelos de dominio pequenos e uma API de alto nivel para que
+aplicacoes consumidoras nao precisem lidar diretamente com `DriveItem`,
+envelopes OData, URLs de continuacao ou detalhes de upload do SDK.
 
-## Objetivo
+> Status: desenvolvimento ativo. A navegacao remota e os uploads de arquivos
+> estao funcionais, mas a API ainda pode mudar antes da primeira versao estavel.
 
-O objetivo final do projeto e permitir upload de diretorios locais complexos
-para o SharePoint, preservando a estrutura de pastas remotas e reduzindo o
-contato do restante do sistema com detalhes do Graph.
+## Recursos
 
-Fluxo alvo:
+- autenticacao de aplicacao com Microsoft Entra ID;
+- resolucao de um site pela URL humana do SharePoint;
+- listagem paginada de bibliotecas de documentos;
+- obtencao da biblioteca padrao e de sua raiz;
+- iteracao paginada e acumulacao de itens remotos;
+- filtros semanticos para arquivos e pastas;
+- busca de itens por nome, ID e URL web;
+- criacao e garantia de caminhos remotos;
+- upload direto de arquivos pequenos;
+- upload de arquivos grandes por sessao e chunks;
+- politicas de conflito `fail`, `rename` e `replace`;
+- traducao de erros OData para excecoes do Core.
 
-```text
-diretorio local
-  -> resolver site
-  -> escolher drive
-  -> obter root
-  -> encontrar ou criar pastas remotas
-  -> enviar arquivos pequenos e grandes
-  -> retornar resultados semanticos
-```
+O objetivo seguinte e enviar arvores completas de diretorios locais,
+preservando sua estrutura no SharePoint.
 
-## Estado Atual
+## Modelo Conceitual
 
-O Core ja implementa:
-
-- autenticacao com `ClientSecretCredential`;
-- construcao de `GraphServiceClient`;
-- resolucao de site por URL humana do SharePoint;
-- listagem de drives de um site;
-- obtencao do drive padrao;
-- obtencao de drive especifico por id;
-- obtencao do item raiz do drive;
-- listagem de filhos imediatos de uma pasta remota;
-- busca imediata de filhos por nome, id e `web_url`;
-- busca tipada de pasta filha e arquivo filho;
-- criacao de pasta remota;
-- garantia incremental de caminho remoto;
-- upload pequeno com `conflict_behavior`;
-- upload grande com upload session e envio por chunks;
-- parse de models do SDK para models internos;
-- traducao inicial de `ODataError` para erros semanticos do Core.
-
-Ainda faltam principalmente:
-
-- adaptar o resultado do upload grande para um model interno;
-- encapsular os models, request bodies e tasks usados diretamente do SDK;
-- aplicar erros semanticos ao fluxo de upload grande;
-- leitura e mapeamento de arvores locais;
-- upload completo de diretorios locais complexos.
-
-## Estrutura do Repositorio
+O SDK do Microsoft Graph trabalha com `Site`, `Drive` e `DriveItem`. A API de
+alto nivel do MS Cronos usa nomes orientados ao dominio:
 
 ```text
-ms_cronos/
-├─ core/
-│  ├─ __init__.py
-│  ├─ builders.py
-│  ├─ errors.py
-│  ├─ graph_client.py
-│  ├─ models.py
-│  ├─ parse.py
-│  ├─ sharepoint.py
-│  ├─ urls.py
-│  └─ utils.py
-├─ docs/
-│  ├─ LLM.md
-│  └─ SPEC.md
-├─ main.py
-├─ README.md
-└─ requirements.txt
+Microsoft Graph             MS Cronos
+---------------             ---------
+Site                  ->     SharePointSite
+Drive                 ->     DocumentLibrary
+DriveItem             ->     SharePointItem
+arquivo no disco      ->     LocalFile
+resultado de upload   ->     FileUploadResult
 ```
 
-## Mapa Conceitual
+As operacoes de `SharePointService` convertem objetos e envelopes do SDK antes
+de devolve-los ao consumidor.
 
-Hierarquia remota importante:
+## Requisitos
 
-```text
-Tenant
-  -> Site
-  -> Drive (document library)
-  -> DriveItem
-     -> Folder
-     -> File
-```
-
-No Core isso aparece como:
-
-```text
-URL humana
-  -> SiteRef
-  -> DriveRef
-  -> DriveItemRef
-```
+- Python 3.11 ou superior;
+- uma aplicacao registrada no Microsoft Entra ID;
+- permissoes de aplicacao adequadas para os sites e arquivos acessados;
+- consentimento administrativo quando exigido pelo tenant.
 
 ## Instalacao
+
+A partir de um checkout do repositorio:
 
 ```bash
 python -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-No Windows:
+No PowerShell:
 
 ```powershell
 python -m venv venv
 .\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
+
+O projeto ainda nao possui uma distribuicao publicada no PyPI.
 
 ## Configuracao
 
-O projeto usa autenticacao de aplicacao com `ClientSecretCredential`.
-
-Variaveis esperadas no `.env`:
+Crie um arquivo `.env` local:
 
 ```env
-CLIENT_ID=
-CLIENT_SECRET=
-CLIENT_TENANT=
+CLIENT_ID=identificador-da-aplicacao
+CLIENT_SECRET=segredo-da-aplicacao
+CLIENT_TENANT=identificador-do-tenant
 ```
 
-## Exemplo Rapido
+Nunca envie `.env`, client secrets, tokens ou URLs pre-autenticadas de upload
+para o controle de versao.
 
-Exemplo minimo de resolucao de site, navegacao e upload pequeno:
+## Inicio Rapido
 
 ```python
 import asyncio
 from os import getenv
 
-from core import GraphClientManager, GraphCredentials, LocalFile, SharePointService
+from dotenv import load_dotenv
+
+from core import (
+    GraphClientManager,
+    GraphCredentials,
+    LocalFile,
+    SharePointService,
+)
 
 
 async def main() -> None:
+    load_dotenv()
+
     credentials = GraphCredentials(
         client_id=getenv("CLIENT_ID", ""),
         client_secret=getenv("CLIENT_SECRET", ""),
         tenant_id=getenv("CLIENT_TENANT", ""),
     )
 
-    site_url = "https://tenant.sharepoint.com/sites/RHConecta"
-
     async with GraphClientManager(credentials) as manager:
         sharepoint = SharePointService(manager)
 
-        site = await sharepoint.resolve_site(site_url)
-        drive = await sharepoint.get_default_drive(site)
-        root = await sharepoint.get_drive_root(drive)
+        site = await sharepoint.resolve_site(
+            "https://tenant.sharepoint.com/sites/Financeiro"
+        )
+        library = await sharepoint.get_default_drive(site)
+        root = await sharepoint.get_drive_root(library)
 
-        target_folder = await sharepoint.ensure_remote_folder_path(
-            drive,
+        destination = await sharepoint.ensure_remote_folder_path(
+            library,
             root,
-            ("datasets", "2026", "06", "04"),
+            ("relatorios", "2026"),
         )
 
-        local_file = LocalFile.from_uri("/tmp/relatorio.csv")
-
-        result = await sharepoint.upload_small_file(
-            drive,
-            target_folder,
-            local_file,
+        result = await sharepoint.upload(
+            library,
+            destination,
+            LocalFile.from_uri("/tmp/relatorio.csv"),
             conflict_behavior="rename",
         )
 
-        print(site)
-        print(drive)
-        print(target_folder)
-        print(result)
+        print(result.item.id)
+        print(result.remote_name)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-## Exemplos de Uso
+`SharePointService.upload` escolhe automaticamente o fluxo direto ou o fluxo
+por sessao conforme o tamanho do arquivo.
+
+## Navegacao Remota
 
 ### Resolver um site
 
 ```python
-site = await sharepoint.resolve_site("https://tenant.sharepoint.com/sites/RHConecta")
+site = await sharepoint.resolve_site(
+    "https://tenant.sharepoint.com/sites/Financeiro"
+)
 
 print(site.id)
+print(site.display_name)
 print(site.web_url)
 ```
 
-### Listar drives do site
+### Listar bibliotecas
+
+Por padrao, `list_site_drives` percorre todas as paginas:
 
 ```python
-drives = await sharepoint.list_site_drives(site)
+libraries = await sharepoint.list_site_drives(site)
 
-for drive in drives:
-    print(drive.id, drive.name, drive.drive_type)
+for library in libraries:
+    print(library.id, library.name, library.drive_type)
 ```
 
-### Obter o drive padrao e a raiz
+Tambem e possivel limitar o numero de paginas processadas:
 
 ```python
-drive = await sharepoint.get_default_drive(site)
-root = await sharepoint.get_drive_root(drive)
-
-print(drive.name)
-print(root.name, root.is_folder)
+libraries = await sharepoint.list_site_drives(
+    site,
+    pagination=True,
+    max_pages=2,
+)
 ```
 
-### Listar filhos imediatos
+### Acumular todos os filhos
+
+`list_children` consome a paginacao e retorna uma unica colecao:
 
 ```python
-children = await sharepoint.list_children(drive, root)
+root = await sharepoint.get_drive_root(library)
+children = await sharepoint.list_children(library, root)
 
 for child in children:
     print(child.name, child.is_folder, child.is_file)
 ```
 
-Importante: `list_children(...)` nao e recursivo. Cada chamada representa um
-unico nivel da arvore remota.
-
-### Encontrar uma pasta filha
+Um predicado opcional pode filtrar os itens durante a acumulacao:
 
 ```python
-curriculos = await sharepoint.find_child_folder(drive, root, "Curriculos")
-
-if curriculos is None:
-    print("Pasta nao encontrada")
-else:
-    print(curriculos.id, curriculos.web_url)
+folders = await sharepoint.list_children(
+    library,
+    root,
+    filter=lambda item: item.is_folder,
+)
 ```
 
-### Criar uma pasta filha
+### Consumir pagina por pagina
+
+Para evitar acumular todos os itens em memoria, use `iter_children`:
 
 ```python
-created = await sharepoint.create_folder(
-    drive,
+async for page in sharepoint.iter_children(library, root):
+    print(f"Itens nesta pagina: {page.counter}")
+
+    for item in page:
+        print(item.name)
+```
+
+O `PageIterator` do SDK permanece interno; o consumidor recebe somente
+`SharePointItemCollection`.
+
+### Buscar arquivos e pastas
+
+```python
+folder = await sharepoint.find_folder_by_name(
+    library,
     root,
-    "Pasta_de_Teste",
-    conflict_behavior="rename",
+    "Relatorios",
 )
 
-print(created)
-```
-
-### Garantir um caminho remoto inteiro
-
-```python
-leaf = await sharepoint.ensure_remote_folder_path(
-    drive,
+file = await sharepoint.find_file_by_name(
+    library,
     root,
-    ("datasets", "financeiro", "2026", "06"),
-    conflict_behavior="fail",
+    "balanco.pdf",
 )
-
-print(leaf.name)
 ```
 
-### Upload pequeno
+As buscas retornam `None` quando nao encontram um item correspondente.
+
+## Upload
 
 ```python
-local_file = LocalFile.from_uri("/tmp/relatorio.pdf")
+local_file = LocalFile.from_uri("/tmp/backup.zip")
 
-result = await sharepoint.upload_small_file(
-    drive,
+result = await sharepoint.upload(
+    library,
     root,
     local_file,
     conflict_behavior="replace",
 )
 
+print(result.source_path)
 print(result.remote_name)
-print(result.item.id)
+print(result.item.web_url)
 ```
 
-`conflict_behavior` hoje aceita:
+Politicas de conflito:
 
-- `fail`
-- `rename`
-- `replace`
+- `fail`: interrompe se o nome remoto ja existir;
+- `rename`: cria o recurso com um novo nome;
+- `replace`: substitui o conteudo do arquivo remoto existente.
 
-O fluxo de upload pequeno atualmente rejeita arquivos acima de `250_000_000`
-bytes.
+O retorno de ambos os fluxos e `FileUploadResult`; detalhes como
+`UploadSession`, `LargeFileUploadTask` e `DriveItem` nao fazem parte do
+resultado publico.
 
-### Upload grande
+## Colecoes Semanticas
 
-```python
-local_file = LocalFile.from_uri("/tmp/backup.zip")
+As listagens retornam colecoes tipadas em vez de listas cruas:
 
-sdk_result = await sharepoint.upload_large_file(
-    drive,
-    root,
-    local_file,
-    conflict_behavior="rename",
-)
+- `SharePointSiteCollection`;
+- `DocumentLibraryCollection`;
+- `SharePointItemCollection`;
+- `LocalFileCollection`.
 
-print(sdk_result.upload_succeeded)
-print(sdk_result.item_response)
-```
-
-O fluxo cria uma upload session e delega o envio parcial ao
-`LargeFileUploadTask`. Atualmente ele ainda retorna o `UploadResult[DriveItem]`
-do SDK; essa e uma fronteira temporaria da fase 1.
-
-## Colecoes do Core
-
-O Core evita retornar listas cruas quando existe uma colecao semantica mais
-expressiva.
-
-Exemplo:
+Elas suportam iteracao, `len`, acesso por indice, slices e operacoes auxiliares:
 
 ```python
-children = await sharepoint.list_children(drive, root)
-
 print(children.counter)
 print(children.is_empty)
 print(children.first())
 print(children.to_list())
 ```
 
-## Modulos Principais
+## Acesso Avancado Ao SDK
 
-### `core/models.py`
-
-Contem:
-
-- modelos semanticos como `SiteRef`, `DriveRef`, `DriveItemRef`, `LocalFile`;
-- colecoes genericas como `Collection_`, `FrozenCollection`, `MutableCollection`;
-- colecoes concretas como `SiteRefCollection`, `DriveRefCollection`,
-  `DriveItemCollection` e `LocalFileCollection`;
-- contratos de upload como `StagingContentUpload` e `UploadFileResult`.
-
-### `core/graph_client.py`
-
-Responsavel por:
-
-- validar credenciais;
-- criar o `GraphServiceClient`;
-- encapsular o ciclo de vida do `ClientSecretCredential`;
-- permitir uso com `async with`.
-
-### `core/parse.py`
-
-Responsavel por:
-
-- converter `Site`, `Drive` e `DriveItem` do SDK em contratos internos;
-- converter collection responses do SDK em colecoes concretas;
-- adaptar `ODataError` para a hierarquia de erros do Core;
-- adaptar caminhos locais para `LocalFile`.
-
-### `core/builders.py`
-
-Responsavel por:
-
-- montar o `DriveItem` usado para criacao de pastas;
-- preparar o staging de upload pequeno;
-- validar nomes remotos e `conflict_behavior`.
-
-### `core/sharepoint.py`
-
-Contem o servico principal. Hoje ele expoe:
+`GraphClientManager.client` e uma extensao intencional para operacoes ainda nao
+cobertas por `SharePointService`:
 
 ```python
-class SharePointService:
-    async def resolve_site(self, sharepoint_url: str) -> SiteRef: ...
-    async def list_site_drives(self, site_ref: SiteRef) -> DriveRefCollection: ...
-    async def get_default_drive(self, site_ref: SiteRef) -> DriveRef: ...
-    async def get_drive(self, drive_ref: DriveRef) -> DriveRef: ...
-    async def get_drive_root(self, drive_ref: DriveRef) -> DriveItemRef: ...
-    async def list_children(
-        self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-    ) -> DriveItemCollection: ...
-    async def find_child_by_name(
-        self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-        name: str,
-    ) -> DriveItemRef | None: ...
-    async def find_child_by_id(
-        self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-        drive_id: str,
-    ) -> DriveItemRef | None: ...
-    async def find_child_by_web_url(
-        self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-        web_url: str,
-    ) -> DriveItemRef | None: ...
-    async def find_child_folder(
-        self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-        name: str,
-    ) -> DriveItemRef | None: ...
-    async def find_child_file(
-        self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-        name: str,
-    ) -> DriveItemRef | None: ...
-    async def find_child_folder_by_id(
-        self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-        drive_id: str,
-    ) -> DriveItemRef | None: ...
-    async def find_child_folder_web_url(
-        self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-        web_url: str,
-    ) -> DriveItemRef | None: ...
-    async def create_folder(
-        self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-        folder_name: str,
-        conflict_behavior: str = "fail",
-    ) -> DriveItemRef: ...
-    async def ensure_remote_folder_path(
-        self,
-        drive_ref: DriveRef,
-        root_item: DriveItemRef,
-        folders_parts: tuple[str, ...],
-        conflict_behavior: str = "fail",
-    ) -> DriveItemRef: ...
-    async def upload_small_file(
-        self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-        local_file: LocalFile,
-        conflict_behavior: str = "fail",
-    ) -> UploadFileResult: ...
-    async def upload_large_file(
-        self,
-        drive_ref: DriveRef,
-        parent_item_ref: DriveItemRef,
-        local_file: LocalFile,
-        conflict_behavior: str = "fail",
-    ) -> UploadResult[DriveItem]: ...
+async with GraphClientManager(credentials) as manager:
+    raw_response = await manager.client.sites.get()
 ```
 
-## Rotas Mais Importantes do Graph
+Ao usar essa propriedade, o codigo consumidor passa a depender diretamente das
+assinaturas e dos modelos do Microsoft Graph SDK. Para uso comum, prefira
+`SharePointService`.
 
-```http
-GET /sites/{hostname}:/{site-path}
-GET /sites/{site-id}/drives
-GET /sites/{site-id}/drive
-GET /drives/{drive-id}
-GET /drives/{drive-id}/root
-GET /drives/{drive-id}/items/{item-id}/children
-POST /drives/{drive-id}/items/{item-id}/children
-PUT /drives/{drive-id}/items/{item-id}:/{filename}:/content
-PUT /drives/{drive-id}/items/{item-id}/content
-POST /drives/{drive-id}/items/{parent-id}:/{filename}:/createUploadSession
+## Tratamento De Erros
+
+As excecoes de dominio derivam de uma raiz comum. Entre as especializacoes
+disponiveis estao:
+
+- `SiteResolutionError`;
+- `DriveNotFoundError`;
+- `DriveItemNotFoundError`;
+- `GraphPermissionError`;
+- `GraphAuthenticationError`;
+- `GraphResourceConflictError`;
+- `LocalPathNotFoundError`;
+- `InvalidConflictBehaviorError`;
+- `UploadError`.
+
+Exemplo:
+
+```python
+from core import UploadError
+
+try:
+    result = await sharepoint.upload(library, root, local_file)
+except UploadError as error:
+    print(f"Operacao nao concluida: {error}")
 ```
 
-## Fase 2: Abstracao do SDK
-
-O objetivo da fase 2 e impedir que projetos consumidores precisem importar ou
-entender classes geradas pelo Microsoft Graph.
-
-Fronteira desejada:
+## Arquitetura
 
 ```text
-Projeto consumidor
-  -> models, erros e servicos do MS Cronos
-  -> adapters, builders e wrappers internos
+Aplicacao consumidora
+  -> models, colecoes, erros e SharePointService
+  -> parsers, builders e helpers internos
   -> Microsoft Graph SDK
+  -> SharePoint
 ```
 
-Exemplo do contrato final desejado:
+Modulos principais:
 
-```python
-result: UploadFileResult = await sharepoint.upload_large_file(
-    drive,
-    root,
-    local_file,
-    conflict_behavior="rename",
-)
-
-print(result.item.id)
-print(result.remote_name)
+```text
+core/
+├── models.py        # contratos e colecoes semanticas
+├── errors.py        # hierarquia de erros do dominio
+├── graph_client.py  # autenticacao e ciclo de vida do client
+├── sharepoint.py    # operacoes de alto nivel
+├── parse.py         # adaptacao entre SDK e Core
+├── builders.py      # montagem de payloads internos
+├── urls.py          # validacao e construcao de rotas
+└── utils.py         # utilitarios pequenos
 ```
 
-Classes como `DriveItem`, `UploadSession`, `UploadResult`,
-`DriveItemUploadableProperties`, `CreateUploadSessionPostRequestBody` e
-`LargeFileUploadTask` devem permanecer dentro da camada de integracao.
+Os parsers e builders existem para uso interno. Eles nao devem ser considerados
+parte da API estavel do pacote.
 
-## Uso Atual do Repositorio
+## Desenvolvimento
 
-O arquivo `main.py` ainda funciona como laboratorio manual e roteiro de
-validacao do fluxo real contra o Graph:
+`main.py` funciona como laboratorio de integracao contra um tenant real:
 
 ```bash
 python main.py
 ```
 
-## Principios do Projeto
+O repositorio ainda nao possui uma suite automatizada de testes. Antes de uma
+versao estavel, o projeto precisa de testes unitarios para parsers, paginacao,
+conflitos e uploads, alem de testes de integracao opcionais.
 
-- o Core deve ser pequeno e testavel;
-- o SharePoint deve ser exposto por contratos semanticos, nao por envelopes do SDK;
-- o parser deve concentrar adaptacao de models e erros;
-- a camada de servico deve orquestrar chamadas, nao inventar estruturas paralelas;
-- a evolucao futura para daemon e jobs deve reutilizar o Core sem acoplamento.
+## Roadmap
 
-## Leitura Complementar
+- consolidar a superficie publica com `__all__`;
+- manter parsers e builders fora dos exports publicos;
+- modelar diretorios e arvores locais;
+- implementar upload recursivo de diretorios;
+- preservar diretorios vazios;
+- adicionar resultados agregados e relatorios de falha parcial;
+- implementar retries para throttling e erros transitorios;
+- publicar testes automatizados;
+- preparar empacotamento e versionamento.
 
-- [docs/SPEC.md](/Users/eu.phietro/Developer/plangecon/ms_cronos/docs/SPEC.md)
-- [docs/LLM.md](/Users/eu.phietro/Developer/plangecon/ms_cronos/docs/LLM.md)
+## Seguranca
+
+- use o menor conjunto de permissoes compativel com a operacao;
+- nao registre secrets, tokens ou URLs de upload;
+- nao reutilize URLs de sessao fora do fluxo que as criou;
+- trate os IDs e metadados do tenant como informacao sensivel;
+- revise logs antes de compartilha-los publicamente.
+
+## Documentacao Complementar
+
+- [Especificacao tecnica](docs/SPEC.md)
+- [Guia de contexto para LLMs](docs/LLM.md)
+
+## Licenca
+
+Este repositorio ainda nao inclui um arquivo de licenca. Antes de reutilizar ou
+redistribuir o projeto, aguarde a publicacao dos termos aplicaveis.
