@@ -4,17 +4,22 @@ Este modulo adapta o SDK do Graph aos contratos semanticos do Core. O objetivo
 e expor operacoes pequenas e previsiveis para navegacao, criacao de pastas e
 upload de arquivos pequenos ou grandes.
 
-Exemplo de uso:
+Exemplo de listagem acumulada:
     service = SharePointService(graph_client_manager)
     site = await service.resolve_site('https://tenant.sharepoint.com/sites/RH')
     drive = await service.get_default_drive(site)
     root = await service.get_drive_root(drive)
     children = await service.list_children(drive, root)
+
+Exemplo de consumo pagina a pagina:
+    async for page in service.iter_children(drive, root):
+        for item in page:
+            print(item.name)
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 
 from msgraph.generated.drives.item.items.item.create_upload_session.create_upload_session_post_request_body import (
     CreateUploadSessionPostRequestBody,
@@ -22,6 +27,9 @@ from msgraph.generated.drives.item.items.item.create_upload_session.create_uploa
 from msgraph.generated.models.drive import Drive
 from msgraph.generated.models.drive_collection_response import DriveCollectionResponse
 from msgraph.generated.models.drive_item import DriveItem
+from msgraph.generated.models.drive_item_collection_response import (
+    DriveItemCollectionResponse,
+)
 from msgraph.generated.models.drive_item_uploadable_properties import (
     DriveItemUploadableProperties,
 )
@@ -67,7 +75,6 @@ from core.parse import (
     parse_drive,
     parse_drive_collection_response,
     parse_drive_item,
-    parse_drive_item_collection_response,
     parse_o_data_error,
     parse_site,
 )
@@ -537,75 +544,154 @@ class SharePointService:
             # 3. Converte o `DriveItem` raiz em `SharePointItem`.
             return parse_drive_item(site_response)
 
+    async def iter_children(
+        self,
+        library: DocumentLibrary,
+        parent: SharePointItem,
+    ) -> AsyncIterator[SharePointItemCollection]:
+        """Percorre, sob demanda, as paginas de filhos de um item remoto.
+
+        O metodo encapsula o ``PageIterator`` do SDK e converte cada pagina em
+        uma ``SharePointItemCollection``. A proxima requisicao somente acontece
+        quando o consumidor avanca o ``async for``.
+
+        Args:
+            library: Biblioteca que contem o item remoto consultado.
+            parent: Item cuja relacao ``children`` sera percorrida.
+
+        Yields:
+            Uma colecao semantica para cada pagina nao vazia devolvida pelo
+            Microsoft Graph.
+
+        Raises:
+            GraphResponseError: Se o Graph nao devolver o envelope inicial.
+            TypeError: Se uma pagina contiver um objeto diferente de
+                ``DriveItem``.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+
+        Note:
+            Uma primeira resposta sem itens encerra o gerador sem produzir
+            colecoes. Este metodo nao acumula paginas em memoria.
+        """
+
+        async def get_first_page(
+            library: DocumentLibrary, parent: SharePointItem
+        ) -> DriveItemCollectionResponse | None:
+            """Solicita o envelope inicial usado para criar o paginador."""
+
+            try:
+                # A consulta parte da biblioteca e do item remoto informados.
+                # O envelope concreto inicializa o `PageIterator`.
+                response = (
+                    await self._client_manager.client.drives.by_drive_id(library.id)
+                    .items.by_drive_item_id(parent.id)
+                    .children.get()
+                )
+
+                # Sem envelope nao existe informacao suficiente para iniciar a
+                # conversao ou descobrir um eventual `odata_next_link`.
+                if not response:
+                    raise GraphResponseError(
+                        "O Graph nao retornou resposta ao listar os drives do "
+                        f"site {library.id}."
+                    )
+
+                # Uma colecao vazia representa ausencia de filhos e encerra o
+                # gerador sem produzir pagina semantica.
+                if not response.value:
+                    return None
+
+            except ODataError as error:
+                # Traduz a falha remota antes que um tipo do SDK atravesse a
+                # fronteira publica do servico.
+                raise parse_o_data_error(error, operation="iter_children")
+            else:
+                # O envelope permanece cru somente dentro deste metodo, pois
+                # ainda sera usado para construir o paginador.
+
+                return response
+
+        response = await get_first_page(library=library, parent=parent)
+
+        # Sem itens na resposta inicial, o gerador termina naturalmente.
+        if response is None:
+            return
+
+        # O request adapter autenticado permite seguir os links de continuacao.
+        page_iterator = PageIterator(
+            response=response,
+            request_adapter=self._client_manager.client.request_adapter,
+        )
+
+        current_page = page_iterator.current_page
+
+        while current_page is not None:
+            # Cada pagina e convertida isoladamente para manter o consumo lazy.
+            page_content = []
+            if current_page.value is None:
+                break
+
+            # Uma pagina vazia encerra o fluxo atual sem emitir colecao.
+            if len(current_page.value) == 0:
+                return
+
+            # O parser unitario reduz cada `DriveItem` ao model interno.
+            for item in current_page.value:
+                if not isinstance(item, DriveItem):
+                    raise TypeError(
+                        f"Erro ao tentar converter {item.__class__} para SharePointITEM"
+                    )
+                page_content.append(parse_drive_item(item))
+            yield SharePointItemCollection.from_collection(page_content)
+
+            # A pagina seguinte e solicitada apenas quando o consumidor avanca.
+            current_page = await page_iterator.next()
+
     async def list_children(
         self,
         library: DocumentLibrary,
         parent: SharePointItem,
+        filter: Callable[[SharePointItem], bool]
+        | None = None,  # Deve retornar uma condição boleana
     ) -> SharePointItemCollection:
-        """Lista os filhos imediatos de uma pasta remota.
+        """Acumula os filhos imediatos de um item remoto.
 
-        A busca nao e recursiva: cada chamada representa exatamente um nivel da
-        arvore remota.
+        O metodo consome todas as paginas produzidas por ``iter_children`` e
+        materializa uma unica ``SharePointItemCollection``. O filtro opcional e
+        aplicado a cada pagina antes da acumulacao. A operacao nao e recursiva.
 
         Args:
-            library: Drive que contem a pasta consultada.
-            parent: Pasta cujos filhos serao listados.
+            library: Biblioteca que contem o item consultado.
+            parent: Item remoto cuja relacao ``children`` sera acumulada.
+            filter: Predicado opcional. Somente itens para os quais ele retornar
+                ``True`` serao incluidos.
 
         Returns:
-            Colecao semantica dos itens encontrados no nivel imediato.
+            Colecao com os itens aceitos de todas as paginas. Quando nao houver
+            filhos ou correspondencias, retorna uma colecao vazia.
 
         Raises:
-            NotAFolderError: Se o item pai nao representar uma pasta.
-            DriveItemNotFoundError: Se o Graph nao devolver a listagem.
+            GraphResponseError: Se o Graph nao devolver o envelope inicial.
             MSCronosError: Se uma falha OData for traduzida pelo Core.
         """
+
+        pages = []
         try:
-            # 1. Parte de um drive e de um item pai ja resolvidos para
-            # consultar os filhos imediatos da pasta no Graph.
-            if not parent.is_folder:
-                raise NotAFolderError(
-                    f"O item {parent.id} nao pode ser usado em "
-                    "list_children porque nao representa uma pasta."
-                )
+            async for page in self.iter_children(library=library, parent=parent):
+                if not filter:
+                    pages.extend(page)
+                    continue
+                pages.extend(item for item in page if filter(item))
 
-            response = (
-                await self._client_manager.client.drives.by_drive_id(library.id)
-                .items.by_drive_item_id(parent.id)
-                .children.get()
-            )
-
-            # 2. A rota de filhos devolve um envelope de colecao contendo
-            #    `DriveItem`s em `response.value`.
-            if not response:
-                raise DriveItemNotFoundError(
-                    "O Graph nao retornou resposta ao listar os filhos do "
-                    f"item {parent.id} no drive {library.id}."
-                )
-
-        except NotAFolderError:
-            # Um item que nao e pasta nao pode ter filhos navegaveis neste
-            # contrato.
+        except Exception:
             raise
-        except DriveItemNotFoundError:
-            # Envelope ausente ou item inacessivel continua como erro interno
-            # de DriveItem.
-            raise
-        except ODataError as error:
-            # O contexto da operacao ajuda o parser a diferenciar falhas de
-            # pasta, item e drive.
-            raise parse_o_data_error(error, operation="list_children")
-        else:
-            # 3. O envelope cru e convertido para `SharePointItemCollection`, a
-            # forma semantica de navegacao usada pelo Core.
-            return parse_drive_item_collection_response(response)
+
+        return SharePointItemCollection.from_collection(pages)
 
     # Busca de filhos imediatos
 
     async def find_child_by_name(
-        self,
-        library: DocumentLibrary,
-        parent: SharePointItem,
-        name: str,
+        self, library: DocumentLibrary, parent: SharePointItem, name: str
     ) -> SharePointItem | None:
         """Busca um filho imediato pelo nome dentro de uma pasta remota.
 
@@ -618,14 +704,15 @@ class SharePointService:
             Primeiro filho correspondente ou ``None`` quando nao encontrado.
 
         Raises:
-            NotAFolderError: Se o item pai nao representar uma pasta.
-            DriveItemNotFoundError: Se a listagem do pai falhar.
+            GraphResponseError: Se a listagem de filhos falhar.
             MSCronosError: Se uma falha OData for traduzida pelo Core.
         """
         try:
             # Reaproveita `list_children` para manter uma unica rota de
             # navegacao remota.
-            children = await self.list_children(library, parent)
+            children = await self.list_children(
+                library, parent, filter=lambda item: item.name == name
+            )
 
             # A busca e local aos filhos imediatos; nao percorre subpastas.
             for child in children:
@@ -663,14 +750,15 @@ class SharePointService:
             Filho correspondente ou ``None`` quando nao encontrado.
 
         Raises:
-            NotAFolderError: Se o item pai nao representar uma pasta.
-            DriveItemNotFoundError: Se a listagem do pai falhar.
+            GraphResponseError: Se a listagem de filhos falhar.
             MSCronosError: Se uma falha OData for traduzida pelo Core.
         """
         try:
             # Reaproveita `list_children` para manter uma unica rota de
             # navegacao remota.
-            children = await self.list_children(library, parent)
+            children = await self.list_children(
+                library, parent, filter=lambda item: item.id == item_id
+            )
 
             # A busca e local aos filhos imediatos; nao percorre subpastas.
             for child in children:
@@ -707,14 +795,15 @@ class SharePointService:
             Filho correspondente ou ``None`` quando nao encontrado.
 
         Raises:
-            NotAFolderError: Se o item pai nao representar uma pasta.
-            DriveItemNotFoundError: Se a listagem do pai falhar.
+            GraphResponseError: Se a listagem de filhos falhar.
             MSCronosError: Se uma falha OData for traduzida pelo Core.
         """
         try:
             # Reaproveita `list_children` para manter uma unica rota de
             # navegacao remota.
-            children = await self.list_children(library, parent)
+            children = await self.list_children(
+                library, parent, filter=lambda item: item.web_url == web_url
+            )
 
             # A busca e local aos filhos imediatos; nao percorre subpastas.
             for child in children:
@@ -734,117 +823,131 @@ class SharePointService:
             # pasta, item e drive.
             raise parse_o_data_error(error, operation="list_children")
 
-    async def find_child_folder(
+    async def get_children_folder(
         self,
         library: DocumentLibrary,
         parent: SharePointItem,
-        name: str,
-    ) -> SharePointItem | None:
-        """Busca uma pasta filha imediata pelo nome.
+    ) -> SharePointItemCollection:
+        """Lista somente as pastas filhas imediatas de um item remoto.
+
+        Todas as paginas sao consumidas por ``list_children`` e filtradas pela
+        facet semantica ``is_folder``.
 
         Args:
-            library: Drive que contem a pasta pai.
-            parent: Pasta em que a busca sera executada.
-            name: Nome exato da pasta procurada.
+            library: Biblioteca que contem o item consultado.
+            parent: Item remoto cuja colecao de filhos sera filtrada.
 
         Returns:
-            Referencia da pasta ou ``None`` quando nao encontrada.
+            Colecao contendo apenas os filhos classificados como pasta.
 
         Raises:
-            NotAFolderError: Se o pai nao for pasta ou se o nome pertencer a
-                um arquivo.
-            DriveItemNotFoundError: Se a listagem do pai falhar.
+            GraphResponseError: Se a listagem nao devolver um envelope valido.
             MSCronosError: Se uma falha OData for traduzida pelo Core.
         """
         try:
             # A busca de pasta parte da mesma listagem imediata usada pelos
             # buscadores genericos; ela nao percorre subpastas.
-            child = await self.find_child_by_name(library, parent, name=name)
+            childrens = await self.list_children(
+                library=library, parent=parent, filter=lambda item: item.is_folder
+            )
+            return childrens
 
-            # Cada filho pode ser arquivo ou pasta. Se o nome coincide com um
-            # arquivo, isso e um conflito de tipo para este contrato.
-            if not child:
-                return None
-
-            if child.is_file:
-                raise NotAFolderError(
-                    f"Conflito de tipo ao buscar pasta filha '{
-                        name
-                    }': existe um arquivo com esse nome no item pai {parent.id}."
-                )
-            # Se o nome bate e nao houve conflito de arquivo, o item pode ser
-            # usado como pasta remota de destino/navegacao.
-
-            return child
-        # `NotAFolderError` pode vir do pai informado a `list_children` ou do
-        # conflito local em que existe arquivo com o mesmo nome esperado.
-        except NotAFolderError:
+        except GraphResponseError:
             raise
-
-        # Erros de item/drive ausente preservam contexto de pai e drive para
-        # facilitar depuracao da navegacao remota.
-        except DriveItemNotFoundError:
-            raise
-        # Erros OData crus do SDK sao traduzidos para a hierarquia semantica do
-        # Core antes de atravessar a fronteira do servico.
         except ODataError as error:
-            raise parse_o_data_error(error, operation="find_child_folder")
+            raise parse_o_data_error(error, operation="get_children_folder")
 
-    async def find_child_file(
+    async def get_children_file(
+        self,
+        library: DocumentLibrary,
+        parent: SharePointItem,
+    ) -> SharePointItemCollection:
+        """Lista somente os arquivos filhos imediatos de um item remoto.
+
+        Todas as paginas sao consumidas por ``list_children`` e filtradas pela
+        facet semantica ``is_file``.
+
+        Args:
+            library: Biblioteca que contem o item consultado.
+            parent: Item remoto cuja colecao de filhos sera filtrada.
+
+        Returns:
+            Colecao contendo apenas os filhos classificados como arquivo.
+
+        Raises:
+            GraphResponseError: Se a listagem nao devolver um envelope valido.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
+        try:
+            children = await self.list_children(
+                library=library, parent=parent, filter=lambda item: item.is_file
+            )
+            return children
+        except GraphResponseError:
+            raise
+        except ODataError as error:
+            raise parse_o_data_error(error, operation="get_children_file")
+
+    async def find_folder_by_name(
         self,
         library: DocumentLibrary,
         parent: SharePointItem,
         name: str,
     ) -> SharePointItem | None:
-        """Busca um arquivo filho imediato pelo nome.
+        """Localiza a primeira pasta filha com o nome informado.
 
         Args:
-            library: Drive que contem a pasta pai.
-            parent: Pasta em que a busca sera executada.
+            library: Biblioteca que contem o item consultado.
+            parent: Item remoto cujas pastas filhas serao pesquisadas.
+            name: Nome exato da pasta procurada.
+
+        Returns:
+            A primeira pasta correspondente ou ``None`` quando nao encontrada.
+
+        Raises:
+            GraphResponseError: Se a listagem de filhos falhar.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
+
+        try:
+            folders = await self.get_children_folder(library=library, parent=parent)
+            candidates = [folder for folder in folders if folder.name == name]
+            if len(candidates) > 0:
+                return candidates[0]
+            return
+        except GraphResponseError:
+            raise
+        except ODataError as e:
+            parse_o_data_error(e)
+
+    async def find_file_by_name(
+        self, library, parent, name: str
+    ) -> SharePointItem | None:
+        """Localiza o primeiro arquivo filho com o nome informado.
+
+        Args:
+            library: Biblioteca que contem o item consultado.
+            parent: Item remoto cujos arquivos filhos serao pesquisados.
             name: Nome exato do arquivo procurado.
 
         Returns:
-            Referencia do arquivo ou ``None`` quando nao encontrado.
+            O primeiro arquivo correspondente ou ``None`` quando nao encontrado.
 
         Raises:
-            NotAFileError: Se o nome corresponder a uma pasta.
-            NotAFolderError: Se o item pai nao representar uma pasta.
-            DriveItemNotFoundError: Se a listagem do pai falhar.
+            GraphResponseError: Se a listagem de filhos falhar.
             MSCronosError: Se uma falha OData for traduzida pelo Core.
         """
+
         try:
-            # A busca de arquivo reaproveita a mesma listagem imediata usada
-            # pelos demais buscadores; ela nao percorre subpastas.
-            child = await self.find_child_by_name(library, parent, name=name)
-
-            # Cada filho pode ser arquivo ou pasta. Se o nome coincide com uma
-            # pasta, isso e um conflito de tipo para este contrato.
-            if not child:
-                return None
-
-            if child.is_folder:
-                raise NotAFileError(
-                    f"Conflito de tipo ao buscar arquivo filho '{
-                        name
-                    }': existe uma pasta com esse nome no item pai {parent.id}."
-                )
-            # Se o nome bate e nao houve conflito de pasta, o item pode ser
-            # usado como arquivo remoto de destino/substituicao.
-
-            return child
-        # `NotAFolderError` pode vir do pai informado a `list_children` ou do
-        # conflito local em que existe arquivo com o mesmo nome esperado.
-        except NotAFolderError:
+            files = await self.get_children_file(library=library, parent=parent)
+            candidates = [file for file in files if file.name == name]
+            if len(candidates) > 0:
+                return candidates[0]
+            return
+        except GraphResponseError:
             raise
-
-        # Erros de item/drive ausente preservam contexto de pai e drive para
-        # facilitar depuracao da navegacao remota.
-        except DriveItemNotFoundError:
-            raise
-        # Erros OData crus do SDK sao traduzidos para a hierarquia semantica do
-        # Core antes de atravessar a fronteira do servico.
-        except ODataError as error:
-            raise parse_o_data_error(error, operation="find_child_file")
+        except ODataError as e:
+            parse_o_data_error(e)
 
     async def find_child_folder_by_id(
         self,
@@ -1070,7 +1173,7 @@ class SharePointService:
             for folder_part in folders_parts:
                 # Primeiro tentamos reaproveitar uma pasta filha imediata
                 # existente sob o item atual.
-                finded_item = await self.find_child_folder(
+                finded_item = await self.find_folder_by_name(
                     library, current_part, folder_part
                 )
 
@@ -1234,7 +1337,7 @@ class SharePointService:
                 None,
                 conflict_behavior,
             )
-            existing_file = await self.find_child_file(
+            existing_file = await self.find_file_by_name(
                 library,
                 parent,
                 local_file.name,

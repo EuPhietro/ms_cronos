@@ -1,8 +1,8 @@
 """Laboratorio manual para validar o Core contra o Microsoft Graph.
 
 Este arquivo nao faz parte da API do Core. Ele serve como roteiro executavel
-para testar manualmente credenciais, resolucao de site, navegacao por drive e
-leitura da raiz enquanto a implementacao evolui.
+para testar manualmente credenciais, resolucao de site, navegacao por drive,
+leitura da raiz e iteracao paginada enquanto a implementacao evolui.
 """
 
 import asyncio
@@ -15,7 +15,6 @@ from rich.traceback import install
 from core import (
     GraphClientManager,
     GraphCredentials,
-    LocalFile,
     SharePointService,
 )
 
@@ -24,108 +23,84 @@ install(show_locals=True)
 
 
 async def main() -> None:
-    # Credenciais da aplicacao carregadas do ambiente local para autenticar no
-    # Microsoft Graph durante os testes manuais.
+    # Credenciais da aplicacao carregadas do ambiente local para autenticacao
+    # no Microsoft Graph durante os testes manuais.
     client_id = getenv("CLIENT_ID", "")
     client_secret = getenv("CLIENT_SECRET", "")
     tenant_id = getenv("CLIENT_TENANT", "")
 
-    # Instanciação do Core
+    # Instanciacao dos componentes principais do Core.
+    credentials = GraphCredentials(
+        client_id,
+        client_secret,
+        tenant_id,
+    )
 
-    credentials = GraphCredentials(client_id, client_secret, tenant_id)
+    graph_client_manager = GraphClientManager(credentials)
+    sharepoint = SharePointService(graph_client_manager)
 
     site_url = "https://plangeconcombr.sharepoint.com/sites/RHConecta"
 
-    graph_client_manager = GraphClientManager(credentials)
+    # 1. Resolve a URL humana do SharePoint para um objeto de dominio.
+    site = await sharepoint.resolve_site(site_url)
 
-    sharepoint = SharePointService(graph_client_manager)
+    print("[bold]Site resolvido:[/bold]")
+    print(site)
 
-    try:
-        # 1. Resolve a URL humana do SharePoint e obtem o `SharePointSite` que sera
-        # usado nas chamadas seguintes.
-        site = await sharepoint.resolve_site(site_url)
-        print(site)
+    # 2. Lista todas as document libraries/drives disponiveis no site.
+    drives = await sharepoint.list_site_drives(site)
 
-        # 2. Lista as bibliotecas/drives disponiveis no site resolvido.
-        drives_library = await sharepoint.list_site_drives(site)
-        print(drives_library)
+    print("[bold]Drives encontrados:[/bold]")
+    print(drives)
 
-        drive_choiced = await sharepoint.find_drive_by_name(name="SESMT", site=site)
-        print(drive_choiced)
+    # 3. Tenta localizar uma biblioteca especifica pelo nome.
+    found_drive = await sharepoint.find_drive_by_name(
+        name="RH & DP",
+        site=site,
+    )
 
-        '''
-        # 3. Recupera a document library padrao do site.
-        default_drive = await sharepoint.get_default_drive(site)
-        print(default_drive)
+    print("[bold]Drive encontrado por nome:[/bold]")
+    print(found_drive)
 
-        # 4. A raiz do drive funciona como ponto de partida da navegacao
-        # remota.
-        root = await sharepoint.get_drive_root(default_drive)
-        print(root)
+    # 4. Recupera tambem a biblioteca padrao para funcionar como fallback.
+    default_drive = await sharepoint.get_default_drive(site)
 
-        # 5. Lista os filhos imediatos da raiz para inspecionar a estrutura do
-        # drive.
-        children = await sharepoint.list_children(default_drive, root)
-        print(children)
+    print("[bold]Drive padrao:[/bold]")
+    print(default_drive)
 
-        # 6. Escolhe uma pasta filha para continuar o laboratorio.
-        curriculos_drive_item = children[0]
-        print(curriculos_drive_item)
+    # 5. Seleciona a biblioteca encontrada pelo nome ou, caso ela nao exista,
+    # utiliza a biblioteca padrao do site.
+    selected_drive = found_drive if found_drive is not None else default_drive
 
-        # 7. Navega para o proximo nivel da arvore remota.
-        curriculos_items = await sharepoint.list_children(
-            default_drive, curriculos_drive_item
-        )
-        print(curriculos_items)
+    print("[bold]Drive selecionado:[/bold]")
+    print(selected_drive)
 
-        # 8. Cria uma pasta filha imediata sob a pasta escolhida.
-        created_drive_item = await sharepoint.create_folder(
-            default_drive,
-            curriculos_drive_item,
-            "Pasta_de_Teste_1345",
-            conflict_behavior="rename",
-        )
-        print(created_drive_item)
+    # 6. Recupera o item raiz da biblioteca selecionada.
+    root = await sharepoint.get_drive_root(selected_drive)
 
-        # 9. Garante uma cadeia inteira de diretorios remotos a partir da raiz.
-        created_hierarcly = await sharepoint.ensure_remote_folder_path(
-            default_drive,
-            root,
-            folders_parts=("datasets3", "2026", "05", "21", "20-00", "2", "0"),
-        )
-        print(created_hierarcly)
+    print("[bold]Root do drive:[/bold]")
+    print(root)
 
-        # 10. Converte um caminho local em `LocalFile` para exercitar o fluxo
-        # de upload pequeno.
-        """
-        local_file = LocalFile.from_uri(
-            r'/Users/eu.phietro/Downloads/'
-            r', Relatório sobre banco de delos 2.pdf'
-        )
+    # 7. Testa a operacao agregada que retorna os filhos da raiz.
+    children = await sharepoint.list_children(
+        selected_drive,
+        root,
+    )
 
-        # 11. Envia o arquivo para a pasta remota garantida acima.
-        created_file = await sharepoint.upload_small_file(
-            default_drive,
-            root,
-            local_file,
-            'rename',
-        )
-        print(created_file)
-        """
-        # 12. Upload large File
+    print("[bold]Resultado de list_children:[/bold]")
+    print(children)
 
-        large_file = LocalFile.from_uri(
-            r"/Users/eu.phietro/Downloads/untitled folder.zip"
-        )
+    # 8. Testa separadamente a iteracao paginada.
+    #
+    # Esta consulta e intencionalmente repetida para comparar o comportamento
+    # de `list_children` com `iter_children`.
+    print("[bold]Paginas retornadas por iter_children:[/bold]")
 
-        large_upload_result = await sharepoint._upload_large_file(
-            default_drive, root, large_file, conflict_behavior="rename"
-        )
-
-        print(large_upload_result)
-    '''
-    except Exception:
-        raise
+    async for page in sharepoint.iter_children(
+        selected_drive,
+        root,
+    ):
+        print(page)
 
 
 if __name__ == "__main__":
