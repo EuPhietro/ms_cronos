@@ -1,9 +1,15 @@
-# Ignorando venv
-venv/*
+# Ignorando ambientes virtuais
+venv/
+.venv/
 
 # Ignorando caches
-*__pycache___/*
+__pycache__/
+**/__pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Ignorando variáveis de ambiente
 .env
@@ -12,8 +18,3 @@ venv/*
 # Ignorando .vscode
 
 .vscode/
-
-
-# Ignorando chace do ruff
-.ruff_cache
-

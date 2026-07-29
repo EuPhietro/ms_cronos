@@ -4,10 +4,15 @@ Este modulo concentra:
 - contratos simples de entrada e saida do Core;
 - referencias enxutas para site, drive, item e arquivo local;
 - colecoes genericas reutilizaveis, separando leitura, mutabilidade e
-  imutabilidade.
+  imutabilidade;
+- snapshots do sistema de arquivos local usados no planejamento de uploads.
 
 A ideia e que o restante do projeto dependa destes tipos em vez de consumir
 objetos crus do SDK do Microsoft Graph.
+
+O fluxo planejado para diretorios possui duas representacoes:
+- `FilesystemTree` descreve fielmente o que o scanner encontrou no disco;
+- `StagingFilesystemTree` descrevera o que esta preparado para ser enviado.
 
 Exemplo basico:
     credentials = GraphCredentials(
@@ -27,6 +32,88 @@ Exemplo basico:
     assert not sites.is_empty
     assert sites.first() == site
 """
+
+# TODO(directory-upload): concluir o pipeline de preparacao de diretorios.
+#
+# Fluxo esperado:
+#
+#    LocalFilesystemScanner
+#        -> FilesystemTree
+#        -> conversor/builder de staging
+#        -> StagingFilesystemTree
+#        -> servico de upload
+#
+# O scanner deve somente inspecionar o disco e montar `FilesystemTree`. Ele nao
+# deve conhecer bibliotecas, itens remotos, conflito de nomes ou chamadas ao
+# Microsoft Graph.
+#
+# 1. Concluir o contrato do snapshot local:
+#
+#    - adicionar `relative_path: Path` a `DirectoryLevel`, ou documentar uma
+#      operacao equivalente em `FilesystemTree`;
+#    - calcular o tamanho de cada nivel somente com seus arquivos diretos;
+#    - derivar tamanho e contadores totais a partir de `levels`;
+#    - preservar diretorios vazios;
+#    - manter arquivos vazios invalidos por padrao e representa-los somente
+#      quando a politica explicita `allow_empty="allow"` for usada;
+#    - preservar a ordem top-down produzida por `Path.walk()`.
+#
+# 2. Implementar os modelos de staging. Eles representam recursos locais ja
+#    associados ao destino remoto e prontos para consumo pelo uploader:
+#
+#    @dataclass(frozen=True)
+#    class StagingFile(CollectionItem):
+#        source: LocalFile
+#        target_path: str
+#        conflict_behavior: ConflictBehavior
+#
+#    @dataclass(frozen=True)
+#    class StagingFolder(CollectionItem):
+#        source: LocalFolder
+#        target_path: str
+#
+#    `target_path` deve ser um fragmento remoto relativo, nunca uma URL completa
+#    do Graph nem um caminho absoluto do computador local.
+#
+#    @dataclass(frozen=True)
+#    class StagingFileCollection(FrozenCollection[StagingFile]):
+#        pass
+#
+#    @dataclass(frozen=True)
+#    class StagingFolderCollection(FrozenCollection[StagingFolder]):
+#        pass
+#
+#    @dataclass(frozen=True)
+#    class StagingDirectoryLevel(CollectionItem):
+#        source: DirectoryLevel
+#        target_path: str
+#        files: StagingFileCollection
+#        folders: StagingFolderCollection
+#
+#    @dataclass(frozen=True)
+#    class StagingDirectoryLevelCollection(
+#        FrozenCollection[StagingDirectoryLevel]
+#    ):
+#        pass
+#
+#    @dataclass(frozen=True)
+#    class StagingFilesystemTree:
+#        source: FilesystemTree
+#        library: DocumentLibrary
+#        destination: SharePointItem
+#        levels: StagingDirectoryLevelCollection
+#
+# 3. Implementar o conversor/builder que recebe `FilesystemTree`, biblioteca,
+#    pasta remota inicial e politica de conflito, validando todos os caminhos
+#    antes de produzir `StagingFilesystemTree`.
+#
+# 4. Decidir se `StagingFile` substituira `PreparedUpload` ou se o reutilizara
+#    por composicao. Os dois modelos nao devem manter contratos concorrentes
+#    para o mesmo arquivo preparado.
+#
+# 5. Manter `LocalFile`, `LocalFolder`, `DirectoryLevel` e `FilesystemTree`
+#    independentes do SharePoint. Somente os modelos `Staging*` devem conhecer
+#    destino remoto e politica de upload.
 
 from __future__ import annotations
 
@@ -53,14 +140,8 @@ ConflictBehavior = Literal["fail", "rename", "replace"]
 
 # `CollectionItem` permanece como classe base semantica para identificar os
 # modelos que podem viver dentro das colecoes do Core.
-class CollectionItem(ABC):
-    """Marcador semantico para itens que circulam nas colecoes do Core.
 
-    A classe nao adiciona comportamento por enquanto. Ela existe para deixar
-    claro que `SharePointSite`, `DocumentLibrary`, `SharePointItem`, `LocalFile` e
-    `FileUploadResult` sao modelos internos do Core e podem ser agrupados por
-    colecoes semanticas.
-    """
+# BaseClasses
 
 
 @dataclass(frozen=True)
@@ -81,6 +162,18 @@ class GraphCredentials:
     tenant_id: str
 
 
+# Representa um item genérico de coleção
+class CollectionItem(ABC):
+    """Marcador semantico para itens que circulam nas colecoes do Core.
+
+    A classe nao adiciona comportamento por enquanto. Ela existe para deixar
+    claro que `SharePointSite`, `DocumentLibrary`, `SharePointItem`, `LocalFile` e
+    `FileUploadResult` sao modelos internos do Core e podem ser agrupados por
+    colecoes semanticas.
+    """
+
+
+# Remote DocumentLibraries  Models
 @dataclass(frozen=True)
 class SharePointSite(CollectionItem):
     """
@@ -143,58 +236,6 @@ class SharePointItem(CollectionItem):
     is_folder: bool = False
     is_file: bool = False
     size: int | None = None
-
-
-@dataclass(frozen=True)
-class LocalFile(CollectionItem):
-    """
-    Modelo semantico para um arquivo local que pode ser enviado ao SharePoint.
-
-    Exemplo:
-        local_file = LocalFile.from_uri('/tmp/curriculo.pdf')
-    """
-
-    path: Path
-    name: str
-    extension: str | None = None
-    size: int | None = None
-
-    @classmethod
-    def from_uri(cls, path: str | Path) -> LocalFile:
-        """Cria um `LocalFile` a partir de um caminho local `str` ou `Path`.
-
-        Este construtor e permissivo: se o caminho ainda nao existir, `size`
-        permanece `None`. Validacoes mais rigidas ficam no parser ou no fluxo
-        de upload.
-        """
-        resolved_path = Path(path)
-        suffix = resolved_path.suffix or None
-        return cls(
-            path=resolved_path,
-            name=resolved_path.name,
-            extension=suffix,
-            size=resolved_path.stat().st_size if resolved_path.exists() else None,
-        )
-
-    def rename(self, name: str) -> Self:
-        """Retorna uma nova referencia local com outro nome sem mover o
-        arquivo."""
-        return type(self)(self.path, name, self.extension, self.size)
-
-
-@dataclass(frozen=True)
-class PreparedUpload(CollectionItem):
-    """Representa um upload pequeno ja preparado para envio.
-
-    O objeto guarda:
-    - o arquivo local de origem;
-    - o fragmento de path Graph que identifica o recurso de criacao;
-    - a estrategia semantica de conflito pedida pelo chamador.
-    """
-
-    file: LocalFile
-    target_path: str
-    conflict_behavior: ConflictBehavior = "fail"
 
 
 @dataclass(frozen=True)
@@ -413,15 +454,260 @@ class SharePointItemCollection(FrozenCollection[SharePointItem]):
     """
 
 
-@dataclass
-class LocalFileCollection(MutableCollection[LocalFile]):
-    """Colecao mutavel de arquivos locais preparados para processamento.
+@dataclass(frozen=True)
+class RootFolder:
+    """Representa o diretorio raiz escolhido para o snapshot local.
+
+    `path` identifica a origem da varredura e `name` preserva o nome real do
+    diretorio. O scanner usa essa raiz como base para calcular os caminhos
+    relativos dos niveis descendentes.
 
     Exemplo:
-        files = LocalFileCollection(_slots=[local_file])
-        files.clear()
-        assert files.is_empty
+        root = RootFolder.from_uri('/tmp/documentos')
     """
+
+    path: Path
+    name: str
+
+    def __post_init__(self):
+        assert self.path.exists(), (
+            f"O caminho passado não é válido self.path.exists(): {self.path.exists()}"
+        )
+        assert self.name == self.path.name, (
+            f"self.name deve corresponder ao nome real do Folder"
+        )
+
+    @classmethod
+    def from_uri(cls, path: str | Path) -> Self:
+        resolved_path = Path(path)
+        return cls(
+            path=resolved_path,
+            name=resolved_path.name,
+        )
+
+
+# Filesystem Models
+
+
+@dataclass(frozen=True)
+class LocalFolder(CollectionItem):
+    """Referencia enxuta de um subdiretorio encontrado no disco.
+
+    O modelo descreve somente o recurso local. Sua correspondencia com uma
+    pasta remota sera responsabilidade futura de `StagingFolder`.
+
+    Exemplo:
+        folder = LocalFolder.from_uri('/tmp/documentos/relatorios')
+    """
+
+    path: Path
+    name: str
+
+    def __post_init__(self):
+        assert self.path.exists(), (
+            f"O caminho passado não é válido self.path.exists(): {self.path.exists()}"
+        )
+        assert self.name == self.path.name, (
+            f"self.name deve corresponder ao nome real do Folder"
+        )
+
+    @classmethod
+    def from_uri(cls, path: str | Path) -> Self:
+        resolved_path = Path(path)
+        return cls(
+            path=resolved_path,
+            name=resolved_path.name,
+        )
+
+
+@dataclass(frozen=True)
+class LocalFile(CollectionItem):
+    """Modelo semantico para um arquivo local elegivel para upload.
+
+    O caminho deve existir e o nome e a extensao devem corresponder ao recurso
+    no disco. Arquivos vazios sao rejeitados por padrao e aceitos apenas quando
+    `allow_empty="allow"` for informado explicitamente.
+
+    Exemplo:
+        local_file = LocalFile.from_uri('/tmp/curriculo.pdf')
+    """
+
+    path: Path
+    name: str
+    size: int
+    extension: str
+    allow_empty: Literal["allow", "deny"] = "deny"
+
+    def __post_init__(self):
+        assert self.path.exists(), (
+            f"O caminho passado não é válido self.path.exists(): {self.path.exists()}"
+        )
+        assert self.name == self.path.name, (
+            "self.name deve corresponder ao nome real do arquivo"
+        )
+        assert self.extension == self.path.suffix, (
+            "self.extension deve corresponder a extensão real"
+        )
+        if self.allow_empty == "deny":
+            assert self.size > 0, "self.size deve ter conteúdo"
+        if self.allow_empty == "allow":
+            assert self.size >= 0
+
+    @classmethod
+    def from_uri(cls, path: str | Path) -> Self:
+        """Cria um `LocalFile` estrito a partir de um caminho local.
+
+        A consulta a `stat()` exige que o recurso exista. As demais invariantes
+        sao verificadas pelo `__post_init__`.
+        """
+        resolved_path = Path(path)
+        suffix = resolved_path.suffix
+        return cls(
+            path=resolved_path,
+            name=resolved_path.name,
+            extension=suffix,
+            size=resolved_path.stat().st_size,
+        )
+
+    def rename_on_disk(self, name: str) -> Self:
+        """Renomeia o arquivo no disco e devolve uma referencia atualizada.
+
+        Esta operacao altera o filesystem local. Ela nao serve apenas para
+        escolher um nome remoto diferente.
+        """
+        assert len(name) > 0
+
+        parent = self.path.parent
+        new_path = parent / name
+        new_path = self.path.rename(new_path)
+        return type(self)(new_path, name, self.size, new_path.suffix, self.allow_empty)
+
+
+@dataclass(frozen=True)
+class LocalFolderCollection(FrozenCollection[LocalFolder]):
+    """Colecao imutavel de subdiretorios pertencentes a um nivel local.
+
+    Exemplo:
+        folders = LocalFolderCollection.from_collection([folder])
+    """
+
+
+@dataclass(frozen=True)
+class LocalFileCollection(FrozenCollection[LocalFile]):
+    """Colecao imutavel de arquivos pertencentes a um nivel local.
+
+    Exemplo:
+        files = LocalFileCollection.from_collection([local_file])
+        assert files.first() == local_file
+    """
+
+
+@dataclass(frozen=True, kw_only=True)
+class DirectoryLevel(CollectionItem):
+    """Representa um diretorio e seu conteudo local imediato.
+
+    O nivel corresponde a uma tupla produzida por `Path.walk()`: `path`
+    identifica o diretorio atual, `files` contem somente seus arquivos diretos
+    e `folders` contem somente seus subdiretorios diretos. Descendentes mais
+    profundos aparecem como outros itens de `DirectoryLevelCollection`.
+    """
+
+    path: Path  # Caminho absoluto do diretorio representado por este nivel.
+    files: LocalFileCollection  # Arquivos diretamente contidos no nivel.
+    folders: LocalFolderCollection  # Subdiretorios diretamente contidos.
+
+    @property
+    def total_size(self) -> int:
+        total = 0
+        for file in self.files:
+            total += file.size
+
+        return total
+
+    @property
+    def total_files(self) -> int:
+        return len(self.files)
+
+    @property
+    def total_directories(self) -> int:
+        return len(self.folders)
+
+
+@dataclass(frozen=True)
+class DirectoryLevelCollection(FrozenCollection[DirectoryLevel]):
+    """Colecao imutavel dos niveis locais na ordem produzida pelo scanner."""
+
+    @property
+    def total_size(self) -> int:
+        return sum(level.total_size for level in self)
+
+    @property
+    def total_files(self) -> int:
+        return sum(level.total_files for level in self)
+
+
+@dataclass(frozen=True, kw_only=True)
+class FilesystemTree:
+    """Snapshot plano de uma arvore de diretorios local.
+
+    `root` define a origem da varredura. `levels` guarda cada diretorio
+    encontrado, preferencialmente em ordem top-down, sem carregar em memoria o
+    conteudo binario dos arquivos.
+
+    Esta classe descreve o disco e nao deve conhecer o SharePoint. Um conversor
+    futuro produzira `StagingFilesystemTree`, que sera o contrato de entrada do
+    upload de diretorios.
+    """
+
+    root: RootFolder
+    levels: DirectoryLevelCollection
+
+    def __post_init__(self):
+
+        assert self.root.path.exists()
+
+        for level in self.levels:
+            assert level.path.exists()
+            for dir in level.folders:
+                assert dir.path.exists()
+            for file in level.files:
+                assert file.path.exists()
+
+    @property
+    def total_size(self) -> int:
+        return self.levels.total_size
+
+    @property
+    def total_files(self) -> int:
+        return self.levels.total_files
+
+    @property
+    def total_levels(self) -> int:
+        return len(self.levels)
+
+    @property
+    def total_subdirectories(self) -> int:
+        return sum(level.total_directories for level in self.levels)
+
+
+# Os modelos locais acima registram o snapshot do disco. Os modelos `Staging*`
+# descritos no TODO do modulo formarao, posteriormente, o plano semantico de
+# upload para o SharePoint.
+
+
+@dataclass(frozen=True)
+class PreparedUpload(CollectionItem):
+    """Representa um upload pequeno ja preparado para envio.
+
+    O objeto guarda:
+    - o arquivo local de origem;
+    - o fragmento de path Graph que identifica o recurso de criacao;
+    - a estrategia semantica de conflito pedida pelo chamador.
+    """
+
+    file: LocalFile
+    target_path: str
+    conflict_behavior: ConflictBehavior = "fail"
 
 
 @dataclass

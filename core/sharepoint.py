@@ -688,6 +688,73 @@ class SharePointService:
 
         return SharePointItemCollection.from_collection(pages)
 
+    # Listagens especializadas de filhos
+
+    async def get_children_folder(
+        self,
+        library: DocumentLibrary,
+        parent: SharePointItem,
+    ) -> SharePointItemCollection:
+        """Lista somente as pastas filhas imediatas de um item remoto.
+
+        Todas as paginas sao consumidas por ``list_children`` e filtradas pela
+        facet semantica ``is_folder``.
+
+        Args:
+            library: Biblioteca que contem o item consultado.
+            parent: Item remoto cuja colecao de filhos sera filtrada.
+
+        Returns:
+            Colecao contendo apenas os filhos classificados como pasta.
+
+        Raises:
+            GraphResponseError: Se a listagem nao devolver um envelope valido.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
+        try:
+            # A busca de pasta parte da mesma listagem imediata usada pelos
+            # buscadores genericos; ela nao percorre subpastas.
+            childrens = await self.list_children(
+                library=library, parent=parent, filter=lambda item: item.is_folder
+            )
+            return childrens
+
+        except GraphResponseError:
+            raise
+        except ODataError as error:
+            raise parse_o_data_error(error, operation="get_children_folder")
+
+    async def get_children_file(
+        self,
+        library: DocumentLibrary,
+        parent: SharePointItem,
+    ) -> SharePointItemCollection:
+        """Lista somente os arquivos filhos imediatos de um item remoto.
+
+        Todas as paginas sao consumidas por ``list_children`` e filtradas pela
+        facet semantica ``is_file``.
+
+        Args:
+            library: Biblioteca que contem o item consultado.
+            parent: Item remoto cuja colecao de filhos sera filtrada.
+
+        Returns:
+            Colecao contendo apenas os filhos classificados como arquivo.
+
+        Raises:
+            GraphResponseError: Se a listagem nao devolver um envelope valido.
+            MSCronosError: Se uma falha OData for traduzida pelo Core.
+        """
+        try:
+            children = await self.list_children(
+                library=library, parent=parent, filter=lambda item: item.is_file
+            )
+            return children
+        except GraphResponseError:
+            raise
+        except ODataError as error:
+            raise parse_o_data_error(error, operation="get_children_file")
+
     # Busca de filhos imediatos
 
     async def find_child_by_name(
@@ -822,71 +889,6 @@ class SharePointService:
             # O contexto da operacao ajuda o parser a diferenciar falhas de
             # pasta, item e drive.
             raise parse_o_data_error(error, operation="list_children")
-
-    async def get_children_folder(
-        self,
-        library: DocumentLibrary,
-        parent: SharePointItem,
-    ) -> SharePointItemCollection:
-        """Lista somente as pastas filhas imediatas de um item remoto.
-
-        Todas as paginas sao consumidas por ``list_children`` e filtradas pela
-        facet semantica ``is_folder``.
-
-        Args:
-            library: Biblioteca que contem o item consultado.
-            parent: Item remoto cuja colecao de filhos sera filtrada.
-
-        Returns:
-            Colecao contendo apenas os filhos classificados como pasta.
-
-        Raises:
-            GraphResponseError: Se a listagem nao devolver um envelope valido.
-            MSCronosError: Se uma falha OData for traduzida pelo Core.
-        """
-        try:
-            # A busca de pasta parte da mesma listagem imediata usada pelos
-            # buscadores genericos; ela nao percorre subpastas.
-            childrens = await self.list_children(
-                library=library, parent=parent, filter=lambda item: item.is_folder
-            )
-            return childrens
-
-        except GraphResponseError:
-            raise
-        except ODataError as error:
-            raise parse_o_data_error(error, operation="get_children_folder")
-
-    async def get_children_file(
-        self,
-        library: DocumentLibrary,
-        parent: SharePointItem,
-    ) -> SharePointItemCollection:
-        """Lista somente os arquivos filhos imediatos de um item remoto.
-
-        Todas as paginas sao consumidas por ``list_children`` e filtradas pela
-        facet semantica ``is_file``.
-
-        Args:
-            library: Biblioteca que contem o item consultado.
-            parent: Item remoto cuja colecao de filhos sera filtrada.
-
-        Returns:
-            Colecao contendo apenas os filhos classificados como arquivo.
-
-        Raises:
-            GraphResponseError: Se a listagem nao devolver um envelope valido.
-            MSCronosError: Se uma falha OData for traduzida pelo Core.
-        """
-        try:
-            children = await self.list_children(
-                library=library, parent=parent, filter=lambda item: item.is_file
-            )
-            return children
-        except GraphResponseError:
-            raise
-        except ODataError as error:
-            raise parse_o_data_error(error, operation="get_children_file")
 
     async def find_folder_by_name(
         self,
@@ -1371,7 +1373,7 @@ class SharePointService:
                 # criacao novamente sob o mesmo pai.
                 remote_name = rename_with_uuid(local_file.name)
                 staging_content = build_upload_content(
-                    local_file.rename(remote_name),
+                    local_file.rename_on_disk(remote_name),
                     remote_name,
                     conflict_behavior,
                 )

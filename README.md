@@ -8,7 +8,9 @@ aplicacoes consumidoras nao precisem lidar diretamente com `DriveItem`,
 envelopes OData, URLs de continuacao ou detalhes de upload do SDK.
 
 > Status: desenvolvimento ativo. A navegacao remota e os uploads de arquivos
-> estao funcionais, mas a API ainda pode mudar antes da primeira versao estavel.
+> individuais estao funcionais. O scanner local tambem esta funcional, mas a
+> conversao da arvore para staging e o upload completo de diretorios ainda nao
+> foram implementados. A API pode mudar antes da primeira versao beta.
 
 ## Recursos
 
@@ -23,10 +25,13 @@ envelopes OData, URLs de continuacao ou detalhes de upload do SDK.
 - upload direto de arquivos pequenos;
 - upload de arquivos grandes por sessao e chunks;
 - politicas de conflito `fail`, `rename` e `replace`;
+- scanner recursivo de diretorios locais baseado em `Path.walk()`;
+- snapshot plano com contadores de arquivos, diretorios, niveis e bytes;
+- preservacao de diretorios vazios no snapshot local;
 - traducao de erros OData para excecoes do Core.
 
-O objetivo seguinte e enviar arvores completas de diretorios locais,
-preservando sua estrutura no SharePoint.
+O objetivo seguinte e converter `FilesystemTree` em um plano de staging e
+enviar arvores completas, preservando sua estrutura no SharePoint.
 
 ## Modelo Conceitual
 
@@ -40,6 +45,8 @@ Site                  ->     SharePointSite
 Drive                 ->     DocumentLibrary
 DriveItem             ->     SharePointItem
 arquivo no disco      ->     LocalFile
+diretorio no disco    ->     DirectoryLevel
+arvore local          ->     FilesystemTree
 resultado de upload   ->     FileUploadResult
 ```
 
@@ -48,7 +55,7 @@ de devolve-los ao consumidor.
 
 ## Requisitos
 
-- Python 3.11 ou superior;
+- Python 3.12 ou superior (`LocalFileSystemScanner` usa `Path.walk()`);
 - uma aplicacao registrada no Microsoft Entra ID;
 - permissoes de aplicacao adequadas para os sites e arquivos acessados;
 - consentimento administrativo quando exigido pelo tenant.
@@ -146,14 +153,42 @@ if __name__ == "__main__":
 `SharePointService.upload` escolhe automaticamente o fluxo direto ou o fluxo
 por sessao conforme o tamanho do arquivo.
 
+## Scanner Local
+
+`LocalFileSystemScanner` percorre uma raiz sem ler o conteudo binario dos
+arquivos. O resultado e um snapshot plano: cada diretorio encontrado vira um
+`DirectoryLevel` com seus arquivos e subdiretorios imediatos.
+
+```python
+from core import LocalFileSystemScanner
+
+scanner = LocalFileSystemScanner()
+tree = scanner.scan(
+    "/tmp/documentos",
+    allow_empty="deny",
+    sort_entries=True,
+)
+
+print(tree.root.path)
+print(tree.total_files)
+print(tree.total_size)
+print(tree.total_levels)
+print(tree.total_subdirectories)
+```
+
+`allow_empty="deny"` rejeita arquivos de zero bytes. Use `"allow"` quando o
+snapshot precisar representar arquivos vazios. `sort_entries=True` torna a
+ordem deterministica; sem essa opcao, a ordem segue o sistema de arquivos.
+
+O scanner nao conhece sites, bibliotecas, caminhos remotos nem politicas de
+conflito. Essa associacao pertencera aos futuros modelos de staging.
+
 ## Navegacao Remota
 
 ### Resolver um site
 
 ```python
-site = await sharepoint.resolve_site(
-    "https://tenant.sharepoint.com/sites/Financeiro"
-)
+site = await sharepoint.resolve_site("https://tenant.sharepoint.com/sites/Financeiro")
 
 print(site.id)
 print(site.display_name)
@@ -270,7 +305,9 @@ As listagens retornam colecoes tipadas em vez de listas cruas:
 - `SharePointSiteCollection`;
 - `DocumentLibraryCollection`;
 - `SharePointItemCollection`;
-- `LocalFileCollection`.
+- `LocalFileCollection`;
+- `LocalFolderCollection`;
+- `DirectoryLevelCollection`.
 
 Elas suportam iteracao, `len`, acesso por indice, slices e operacoes auxiliares:
 
@@ -337,6 +374,7 @@ Modulos principais:
 core/
 ├── models.py        # contratos e colecoes semanticas
 ├── errors.py        # hierarquia de erros do dominio
+├── filesystem.py    # scanner e snapshot da arvore local
 ├── graph_client.py  # autenticacao e ciclo de vida do client
 ├── sharepoint.py    # operacoes de alto nivel
 ├── parse.py         # adaptacao entre SDK e Core
@@ -350,26 +388,32 @@ parte da API estavel do pacote.
 
 ## Desenvolvimento
 
-`main.py` funciona como laboratorio de integracao contra um tenant real:
+`main.py` funciona atualmente como verificacao manual do scanner local:
 
 ```bash
 python main.py
 ```
 
-O repositorio ainda nao possui uma suite automatizada de testes. Antes de uma
-versao estavel, o projeto precisa de testes unitarios para parsers, paginacao,
-conflitos e uploads, alem de testes de integracao opcionais.
+O repositorio ainda nao possui uma suite automatizada de testes. O scanner ja
+foi exercitado manualmente com uma arvore de 45.779 arquivos, 21.862 niveis e
+554.889.293 bytes, mas esse resultado nao substitui testes reproduziveis.
+
+Antes da beta, o projeto precisa ao menos de testes unitarios para models,
+scanner, parsers, paginacao e montagem do staging, alem de um teste de
+integracao controlado para upload de diretorios.
 
 ## Roadmap
 
-- consolidar a superficie publica com `__all__`;
-- manter parsers e builders fora dos exports publicos;
-- modelar diretorios e arvores locais;
+- corrigir as inconsistencias de assinatura registradas em `docs/SPEC.md`;
+- definir os modelos `StagingFile`, `StagingFolder`,
+  `StagingDirectoryLevel` e `StagingFilesystemTree`;
+- implementar a conversao de `FilesystemTree` para staging remoto;
 - implementar upload recursivo de diretorios;
-- preservar diretorios vazios;
 - adicionar resultados agregados e relatorios de falha parcial;
 - implementar retries para throttling e erros transitorios;
-- publicar testes automatizados;
+- adicionar testes automatizados e uma matriz minima de integracao;
+- consolidar a superficie publica com `__all__`;
+- manter parsers e builders fora dos exports publicos;
 - preparar empacotamento e versionamento.
 
 ## Seguranca

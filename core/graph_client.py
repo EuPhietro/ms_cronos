@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from types import TracebackType
-from typing import Self
+
 from azure.identity.aio import ClientSecretCredential
 from msgraph.graph_service_client import GraphServiceClient
 

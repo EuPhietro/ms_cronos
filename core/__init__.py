@@ -47,6 +47,7 @@ from core.errors import (
     UploadError,
     UploadSessionCreationError,
 )
+from core.filesystem import LocalFileSystemScanner
 
 # Integracao com o Microsoft Graph: criacao do client e ciclo de vida da
 # credencial assincrona.
@@ -59,13 +60,18 @@ from core.models import (
     Collection_,
     CollectionItem,
     ConflictBehavior,
+    DirectoryLevel,
+    DirectoryLevelCollection,
     DocumentLibrary,
     DocumentLibraryCollection,
+    FilesystemTree,
     FileUploadResult,
     FrozenCollection,
     GraphCredentials,
     LocalFile,
     LocalFileCollection,
+    LocalFolder,
+    LocalFolderCollection,
     MutableCollection,
     PreparedUpload,
     PreparedUploadCollection,

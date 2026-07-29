@@ -1,343 +1,283 @@
 # LLM Repository Guide
 
-Este documento existe para acelerar a leitura do repositorio por LLMs, agentes
-e assistentes de codigo.
+Este arquivo oferece contexto operacional para assistentes que trabalham no
+MS Cronos. O codigo e `docs/SPEC.md` continuam sendo as fontes de verdade.
 
-## Resumo Curto
+## Resumo
 
-- linguagem principal: Python;
-- dominio atual: SharePoint + Microsoft Graph;
-- camada principal implementada: `core/`;
-- objetivo atual: abstrair o SDK depois de validar navegacao e uploads pequeno
-  e grande;
-- objetivo futuro: API reutilizavel e upload de diretorios locais complexos.
+MS Cronos e um wrapper Python assincrono para SharePoint via Microsoft Graph.
+O pacote reduz a exposicao dos modelos do SDK por meio de modelos internos,
+colecoes tipadas, parsers, builders e uma camada de servico.
 
-## O Que Ja Existe
-
-O Core ja implementa:
-
-- autenticacao Graph;
-- resolucao de site por URL humana;
-- listagem de drives;
-- obtencao do drive padrao;
-- obtencao da raiz do drive;
-- listagem de filhos imediatos;
-- busca de filhos por nome, id e `web_url`;
-- busca tipada de pasta e arquivo;
-- criacao de pasta remota;
-- garantia de caminho remoto;
-- upload pequeno com conflito `fail`, `rename` ou `replace`;
-- upload grande com upload session e chunks;
-- parse de models do SDK para models internos;
-- traducao inicial de `ODataError`.
-
-Ainda faltam:
-
-- wrappers para os novos tipos do SDK;
-- factory/parser para o resultado do upload grande;
-- erros semanticos do novo fluxo;
-- leitura recursiva de arvore local;
-- upload completo de diretorios.
-
-## Estrutura Relevante
+O projeto possui dois fluxos:
 
 ```text
-ms_cronos/
-├─ core/
-│  ├─ __init__.py
-│  ├─ builders.py
-│  ├─ errors.py
-│  ├─ graph_client.py
-│  ├─ models.py
-│  ├─ parse.py
-│  ├─ sharepoint.py
-│  ├─ urls.py
-│  └─ utils.py
-├─ docs/
-│  ├─ LLM.md
-│  └─ SPEC.md
-├─ main.py
-├─ README.md
-└─ requirements.txt
+Fluxo remoto
+GraphClientManager -> SharePointService -> SharePoint
+
+Fluxo local
+LocalFileSystemScanner -> FilesystemTree -> staging futuro -> upload futuro
 ```
 
-## Ordem Recomendada de Leitura
+Navegacao, criacao de pastas e uploads individuais estao implementados. O
+scanner local tambem esta implementado. A associacao entre uma arvore local e
+uma arvore remota ainda nao existe.
 
-1. `README.md`
-2. `docs/SPEC.md`
-3. `core/__init__.py`
-4. `core/models.py`
-5. `core/errors.py`
-6. `core/parse.py`
-7. `core/urls.py`
-8. `core/builders.py`
-9. `core/sharepoint.py`
-10. `main.py`
+## Ambiente
 
-## Mapa Conceitual
+- Python minimo: 3.12;
+- SDK principal: `msgraph-sdk==1.58.0`;
+- entrada publica recomendada: `from core import ...`;
+- `main.py`: verificacao manual do scanner local;
+- testes automatizados: ainda inexistentes.
 
-Hierarquia remota relevante:
+Ao inventariar o repositorio, ignore:
 
 ```text
-Tenant
-  -> Site
-  -> Drive
-  -> DriveItem
-     -> Folder
-     -> File
+venv/
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
 ```
 
-Mapeamento para contratos internos:
+## Ordem De Leitura
+
+1. `README.md`: uso publico e status.
+2. `docs/SPEC.md`: contratos, fluxos e pendencias conhecidas.
+3. `core/models.py`: vocabulário do dominio.
+4. `core/filesystem.py`: scanner do disco.
+5. `core/sharepoint.py`: orquestracao remota.
+6. `core/parse.py`: fronteira SDK -> Core.
+7. `core/builders.py` e `core/urls.py`: payloads e rotas.
+8. `core/errors.py`: taxonomia de falhas.
+9. `core/graph_client.py`: autenticacao e ciclo de vida.
+10. `core/__init__.py`: superficie atualmente reexportada.
+
+## Mapa De Modulos
 
 ```text
-SharePoint URL
-  -> SiteRef
-  -> DriveRef
-  -> DriveItemRef
+core/
+├── __init__.py       # reexports atuais
+├── builders.py       # payload de pasta e PreparedUpload
+├── errors.py         # erros semanticos
+├── filesystem.py     # scanner local
+├── graph_client.py   # credencial e GraphServiceClient
+├── models.py         # modelos e colecoes
+├── parse.py          # SDK/OData para Core
+├── sharepoint.py     # servico remoto
+├── urls.py           # validacao e montagem de URLs
+└── utils.py          # rename_with_uuid
 ```
 
-## Filosofia do Core
+## Vocabulário Atual
 
-Ao mexer no projeto, preserve estas regras:
+Nao reintroduza os nomes antigos `SiteRef`, `DriveRef`, `DriveItemRef`,
+`UploadFileResult` ou `StagingContentUpload`.
 
-1. expor contratos pequenos e semanticos;
-2. nao vazar envelopes crus do SDK para fora do Core;
-3. centralizar parse e traducao de erros em `core.parse`;
-4. deixar `core.sharepoint` como orquestrador, nao como model paralelo do SDK.
+Use:
 
-## Modulos e Responsabilidades
+```text
+SharePointSite
+DocumentLibrary
+SharePointItem
+FileUploadResult
+PreparedUpload
+LocalFile
+LocalFolder
+DirectoryLevel
+FilesystemTree
+```
 
-### `core/models.py`
+Colecoes publicas de retorno sao imutaveis e concretas:
 
-Contem:
+```text
+SharePointSiteCollection
+DocumentLibraryCollection
+SharePointItemCollection
+LocalFileCollection
+LocalFolderCollection
+DirectoryLevelCollection
+```
 
-- `GraphCredentials`
-- `SiteRef`
-- `DriveRef`
-- `DriveItemRef`
-- `LocalFile`
-- `StagingContentUpload`
-- `UploadFileResult`
-- colecoes genericas e colecoes concretas
+## Regras De Arquitetura
 
-Use este modulo quando a tarefa envolver:
+1. Modelos do Graph nao devem aparecer no retorno publico de
+   `SharePointService`.
+2. Conversoes do SDK pertencem a `core/parse.py`.
+3. Montagem de payloads pertence a `core/builders.py`.
+4. Montagem de URLs pertence a `core/urls.py`.
+5. Erros OData sao traduzidos na fronteira do servico.
+6. O scanner nao deve conhecer IDs, URLs ou conflitos do SharePoint.
+7. Models de snapshot descrevem o disco; models de staging descrevem uma
+   intencao de upload.
+8. Nao leia bytes durante o scan. Abra o arquivo somente no momento do upload.
+9. Preserve excecoes semanticas com `raise`; ao encadear outra falha, use
+   `raise ... from error`.
+10. Trabalhe com mudancas locais existentes; nao reverta alteracoes do usuario.
 
-- novo model interno;
-- colecao semantica;
-- contrato de retorno do Core.
+## API Remota
 
-### `core/errors.py`
-
-Contem a hierarquia semantica de erros do projeto.
-
-Use este modulo quando a tarefa envolver:
-
-- novo erro de dominio;
-- refinamento de mensagens de erro;
-- mapeamento de falhas do Graph para erros internos.
-
-### `core/graph_client.py`
-
-Contem o manager do Graph.
-
-Use este modulo quando a tarefa envolver:
-
-- credenciais;
-- scopes;
-- criacao ou fechamento do `GraphServiceClient`.
-
-### `core/parse.py`
-
-Contem adaptadores entre SDK e Core.
-
-Use este modulo quando a tarefa envolver:
-
-- parse de `Site`, `Drive` ou `DriveItem`;
-- parse de collection responses;
-- parse de `ODataError`;
-- parse de caminho local para `LocalFile`.
-
-### `core/urls.py`
-
-Contem helpers de URL e rotas Graph.
-
-Use este modulo quando a tarefa envolver:
-
-- validacao de URL do SharePoint;
-- montagem de URL de resolucao;
-- montagem de fragmento ou URL de upload pequeno.
-
-### `core/builders.py`
-
-Contem builders de payload e staging.
-
-Use este modulo quando a tarefa envolver:
-
-- body para criacao de pasta;
-- staging de upload pequeno;
-- validacao de `conflict_behavior`;
-- validacao de nome remoto.
-
-### `core/sharepoint.py`
-
-Contem o servico principal.
-
-Use este modulo quando a tarefa envolver:
-
-- navegacao remota;
-- criacao de pasta;
-- upload pequeno;
-- fluxo de negocio sobre site, drive e item.
-
-### `core/utils.py`
-
-Contem helpers pequenos e reutilizaveis.
-
-Hoje o destaque e:
-
-- `rename_with_uuid(...)`
-
-## API Atual Mais Importante
-
-O `SharePointService` hoje expoe principalmente:
-
-- `resolve_site(...)`
-- `list_site_drives(...)`
-- `get_default_drive(...)`
-- `get_drive(...)`
-- `get_drive_root(...)`
-- `list_children(...)`
-- `find_child_by_name(...)`
-- `find_child_by_id(...)`
-- `find_child_by_web_url(...)`
-- `find_child_folder(...)`
-- `find_child_file(...)`
-- `find_child_folder_by_id(...)`
-- `find_child_folder_web_url(...)`
-- `create_folder(...)`
-- `ensure_remote_folder_path(...)`
-- `upload_small_file(...)`
-- `upload_large_file(...)`
-
-## Exemplo Minimo
+### Sites e bibliotecas
 
 ```python
-import asyncio
-from os import getenv
-
-from core import GraphClientManager, GraphCredentials, LocalFile, SharePointService
-
-
-async def main() -> None:
-    credentials = GraphCredentials(
-        client_id=getenv("CLIENT_ID", ""),
-        client_secret=getenv("CLIENT_SECRET", ""),
-        tenant_id=getenv("CLIENT_TENANT", ""),
-    )
-
-    async with GraphClientManager(credentials) as manager:
-        sharepoint = SharePointService(manager)
-
-        site = await sharepoint.resolve_site(
-            "https://tenant.sharepoint.com/sites/RHConecta"
-        )
-        drive = await sharepoint.get_default_drive(site)
-        root = await sharepoint.get_drive_root(drive)
-
-        target = await sharepoint.ensure_remote_folder_path(
-            drive,
-            root,
-            ("datasets", "2026", "06"),
-        )
-
-        local_file = LocalFile.from_uri("/tmp/relatorio.csv")
-        result = await sharepoint.upload_small_file(
-            drive,
-            target,
-            local_file,
-            conflict_behavior="rename",
-        )
-
-        print(result.remote_name)
-
-
-asyncio.run(main())
+site = await service.resolve_site(sharepoint_url)
+libraries = await service.list_site_drives(site)
+library = await service.get_default_drive(site)
+library = await service.get_drive_by_id(drive_id)
+library = await service.find_drive_by_name(site, name)
 ```
 
-## Regras Operacionais Importantes
+### Itens e paginacao
 
-### Navegacao
+```python
+root = await service.get_drive_root(library)
 
-- `list_children(...)` nao e recursivo;
-- buscas operam sobre filhos imediatos;
-- um `drive_item_id` identifica o item dentro do drive informado.
+async for page in service.iter_children(library, root):
+    for item in page:
+        print(item.name)
 
-### Upload pequeno
+all_items = await service.list_children(library, root)
+folders = await service.get_children_folder(library, root)
+files = await service.get_children_file(library, root)
+```
 
-- limite atual: `250_000_000` bytes;
-- `fail` levanta erro se o nome remoto ja existir;
-- `rename` gera novo nome preservando extensao;
-- `replace` substitui o conteudo do arquivo existente.
+`iter_children` e a primitiva paginada. `list_children` e o acumulador.
+Buscas por nome, ID e URL percorrem filhos imediatos, nao descendentes
+recursivos.
 
-### Upload grande
+### Pastas e upload
 
-- cria uma upload session por path remoto;
-- envia o stream por `LargeFileUploadTask`;
-- usa `MAX_CHUNK_SIZE` como limite de cada trecho;
-- ainda retorna `UploadResult[DriveItem]` do SDK.
+```python
+destination = await service.ensure_remote_folder_path(
+    library,
+    root,
+    ("Financeiro", "2026"),
+)
 
-## Direcao da Fase 2
+result = await service.upload(
+    library,
+    destination,
+    LocalFile.from_uri("/tmp/relatorio.csv"),
+    conflict_behavior="rename",
+)
+```
 
-A API publica deve aceitar e devolver apenas tipos do MS Cronos.
+`upload()` seleciona:
+
+- `PUT /content` ate `250_000_000` bytes;
+- upload session acima desse limite;
+- chunks de ate `60 * 1024 * 1024` bytes no fluxo grande.
+
+O retorno sempre deve permanecer `FileUploadResult`.
+
+## API Local
+
+```python
+from core import LocalFileSystemScanner
+
+tree = LocalFileSystemScanner().scan(
+    "/dados",
+    allow_empty="deny",
+    sort_entries=True,
+)
+
+for level in tree.levels:
+    print(level.path, level.files, level.folders)
+```
+
+`FilesystemTree` e uma representacao plana. Nao presumir que cada nivel
+armazena recursivamente seus descendentes. A ordem top-down e os caminhos
+permitem reconstruir a hierarquia.
+
+## Casos De Borda
+
+### Scanner
+
+- string vazia: `ValueError`;
+- path inexistente: `ValueError`;
+- path que nao e diretorio: `NotADirectoryError`;
+- falha de permissao/leitura: `OSError`;
+- diretorio vazio: gera um `DirectoryLevel`;
+- arquivo vazio: rejeitado por padrao, aceito com `allow_empty="allow"`;
+- arquivo sem extensao: `LocalFile.extension` deve ser `""`, nunca `None`;
+- symlinks: seguir a semantica padrao de `Path.walk()` ate haver politica
+  explicita no projeto.
+
+### Paginacao
+
+- uma pagina vazia nao implica necessariamente ausencia de proxima pagina;
+- o `PageIterator` controla o proprio estado depois de `next()`;
+- nao sincronizar manualmente `current_page`;
+- `list_children` pode consumir muita memoria em bibliotecas grandes;
+- para buscas, descarte paginas sem correspondencia em vez de acumular tudo.
+
+### Upload
+
+- o pai remoto deve ser pasta;
+- o path local deve existir e ser arquivo legivel;
+- `fail`, `rename` e `replace` devem conservar significado nos dois fluxos;
+- URLs de upload session sao sensiveis e nao devem ser registradas;
+- upload grande deve manter o stream aberto durante toda a task;
+- resultados do SDK devem ser convertidos antes do retorno.
+
+## Inconsistencias Que Nao Devem Ser Escondidas
+
+1. `parse_local_file()` pode passar `None` como extensao.
+2. `find_file_by_name()` possui dois parametros sem anotacao.
+3. `LocalFile.rename_on_disk()` renomeia fisicamente o arquivo local.
+4. a politica `allow_empty` do scanner nao e aceita pelo uploader atual.
+5. helpers internos ainda sao reexportados por `core/__init__.py`.
+6. nao ha testes automatizados.
+
+Nao corrija esses pontos incidentalmente durante uma tarefa exclusivamente
+documental. Registre ou trate cada um com escopo e teste proprios.
+
+## Fase Seguinte
+
+Implementar, nesta ordem:
+
+1. modelos `StagingFile` e `StagingFolder`;
+2. colecoes de staging;
+3. `StagingDirectoryLevel`;
+4. `StagingFilesystemTree`;
+5. builder que calcula paths relativos e destinos;
+6. orquestrador que cria pastas antes dos arquivos;
+7. resultado agregado e politica de falha parcial;
+8. retry/backoff para throttling e erros transitorios;
+9. testes unitarios e integracao controlada.
+
+O fluxo alvo e:
 
 ```text
-public API -> internal wrappers/adapters -> Graph SDK
+FilesystemTree
+  -> StagingFilesystemTree
+  -> garantir pasta remota do nivel
+  -> enviar arquivos do nivel
+  -> prosseguir top-down
+  -> produzir relatorio agregado
 ```
 
-Tipos do SDK atualmente visiveis no fluxo grande:
+## Validacao Antes De Encerrar Mudancas
 
-- `DriveItem`
-- `DriveItemUploadableProperties`
-- `UploadSession`
-- `UploadResult`
-- `CreateUploadSessionPostRequestBody`
-- `LargeFileUploadTask`
+Para alteracoes de codigo:
 
-Esses tipos devem ficar restritos aos builders, parsers e wrappers internos.
+```bash
+python -m compileall core main.py
+```
 
-### Erros
+Quando os testes forem adicionados:
 
-O Core prefere levantar erros internos, por exemplo:
+```bash
+python -m pytest
+```
 
-- `SiteResolutionError`
-- `DriveNotFoundError`
-- `DriveItemNotFoundError`
-- `NotAFolderError`
-- `NotAFileError`
-- `FileAlreadyExistError`
-- `FileVeryLargeError`
-- `SmallFileUploadError`
+Tambem confira:
 
-## Heuristicas Para Novas Tarefas
-
-Se a tarefa mencionar:
-
-- "novo model" -> `core/models.py`
-- "novo parse do SDK" -> `core/parse.py`
-- "nova URL Graph" -> `core/urls.py`
-- "novo body de envio" -> `core/builders.py`
-- "nova operacao SharePoint" -> `core/sharepoint.py`
-- "novo erro" -> `core/errors.py`
-
-## Arquivos Fonte de Verdade
-
-Para contexto humano:
-
-- `README.md`
-- `docs/SPEC.md`
-
-Para contexto tecnico atual:
-
-- `core/models.py`
-- `core/sharepoint.py`
-- `core/parse.py`
+- modelos do SDK nao vazaram para assinaturas publicas;
+- imports continuam partindo de `core` para consumidores;
+- docs usam os nomes atuais;
+- `.env`, secrets, tokens e upload URLs nao aparecem no diff;
+- venv e caches nao entram no inventario nem no commit.

@@ -142,8 +142,8 @@ def parse_local_file(path: Path | str) -> LocalFile:
     Diferente de `LocalFile.from_uri`, este parser valida que o caminho existe
     e aponta para arquivo antes de devolver o model interno.
     """
-    # Diferente do construtor permissivo do model, este parser garante que o
-    # caminho realmente representa um arquivo legivel para o Core.
+    # A validacao antecipada produz um erro semantico quando o caminho nao
+    # representa um arquivo. As invariantes restantes pertencem ao model.
     path = Path(path)
 
     if not path.is_file():
