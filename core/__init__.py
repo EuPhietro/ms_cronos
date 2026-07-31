@@ -9,9 +9,8 @@ Regra pratica:
 """
 
 # Modelos e colecoes formam o contrato de dados mais basico do Core.
-# Builders montam staging e bodies do SDK sem expor essa montagem ao servico.
+# Builders montam bodies do SDK sem expor essa montagem ao servico.
 from core.builders import build_folder_drive_item as build_folder_drive_item
-from core.builders import build_upload_content as build_upload_content
 
 # Erros publicos do Core, reexportados para que outras camadas nao precisem
 # conhecer a estrutura interna de modulos.
@@ -48,6 +47,7 @@ from core.errors import (
     UploadSessionCreationError,
 )
 from core.filesystem import LocalFileSystemScanner
+from core.filesystem_staging import StagingTreeBuilder
 
 # Integracao com o Microsoft Graph: criacao do client e ciclo de vida da
 # credencial assincrona.
@@ -73,12 +73,12 @@ from core.models import (
     LocalFolder,
     LocalFolderCollection,
     MutableCollection,
-    PreparedUpload,
-    PreparedUploadCollection,
+    RootUploadMode,
     SharePointItem,
     SharePointItemCollection,
     SharePointSite,
     SharePointSiteCollection,
+    StagingFile,
 )
 from core.parse import (
     adapt_site,

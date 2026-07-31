@@ -38,7 +38,7 @@ from msgraph.generated.models.upload_session import UploadSession
 from msgraph_core import PageIterator
 from msgraph_core.tasks import LargeFileUploadTask
 
-from core.builders import build_folder_drive_item, build_upload_content
+from core.builders import build_folder_drive_item, normalize_conflict_behavior
 from core.errors import (
     DefaultDriveNotFoundError,
     DriveItemNotFoundError,
@@ -65,7 +65,6 @@ from core.models import (
     DocumentLibraryCollection,
     FileUploadResult,
     LocalFile,
-    PreparedUpload,
     SharePointItem,
     SharePointItemCollection,
     SharePointSite,
@@ -79,6 +78,7 @@ from core.parse import (
     parse_site,
 )
 from core.urls import (
+    build_create_content_url,
     build_drive_create_content_url,
     build_graph_site_url,
 )
@@ -919,8 +919,11 @@ class SharePointService:
             return
         except GraphResponseError:
             raise
-        except ODataError as e:
-            parse_o_data_error(e)
+        except ODataError as error:
+            raise parse_o_data_error(
+                error,
+                operation="find_folder_by_name",
+            ) from error
 
     async def find_file_by_name(
         self, library, parent, name: str
@@ -948,8 +951,11 @@ class SharePointService:
             return
         except GraphResponseError:
             raise
-        except ODataError as e:
-            parse_o_data_error(e)
+        except ODataError as error:
+            raise parse_o_data_error(
+                error,
+                operation="find_file_by_name",
+            ) from error
 
     async def find_child_folder_by_id(
         self,
@@ -1243,7 +1249,8 @@ class SharePointService:
         if not parent.is_folder:
             raise NotAFolderError(f"{parent.name} não é um Folder válido")
         if not local_file.path.exists():
-            raise LocalPathNotFoundError("O caminho para o arquivo local não existe")
+            raise LocalPathNotFoundError(
+                "O caminho para o arquivo local não existe")
 
         if not local_file.path.is_file():
             raise LocalPathIsDirectoryError(
@@ -1251,7 +1258,8 @@ class SharePointService:
             )
 
         if not local_file.size:
-            raise LocalFileNotReadableError("Não foi possível ler o arquivo passado")
+            raise LocalFileNotReadableError(
+                "Não foi possível ler o arquivo passado")
 
         if local_file.size > MAX_SMALL_FILE_SIZE:
             return await self._upload_large_file(
@@ -1322,6 +1330,10 @@ class SharePointService:
                 } excede o limite de 250 MB do upload pequeno."
             )
 
+        # A anotacao Literal auxilia o type checker, mas entradas recebidas em
+        # runtime ainda precisam ser normalizadas e validadas explicitamente.
+        conflict_behavior = normalize_conflict_behavior(conflict_behavior)
+
         try:
             # O fluxo pequeno trabalha com o arquivo inteiro em memoria.
             # Portanto, a leitura local acontece antes do `PUT`.
@@ -1332,55 +1344,37 @@ class SharePointService:
             ) from error
 
         try:
-            # O staging concentra o nome remoto final e o fragmento de rota
-            # usado na criacao por nome.
-            staging_content: PreparedUpload = build_upload_content(
-                local_file,
-                None,
-                conflict_behavior,
-            )
+            # A busca determina se o fluxo criara um recurso por nome ou
+            # substituirá diretamente o conteudo de um item existente.
             existing_file = await self.find_file_by_name(
                 library,
                 parent,
                 local_file.name,
             )
 
-            response = None
             remote_name = local_file.name
+            should_create = existing_file is None
 
-            if existing_file is None:
-                # Sem conflito remoto, o upload pequeno cria o arquivo usando a
-                # rota `items/{parent-id}:/{filename}:/content`.
-                create_url = build_drive_create_content_url(
-                    library.id,
-                    parent.id,
-                    staging_content.target_path,
-                )
-                response = await (
-                    self._client_manager.client.drives.by_drive_id(library.id)
-                    .items.by_drive_item_id(parent.id)
-                    .content.with_url(create_url)
-                    .put(content_bytes)
-                )
-            elif staging_content.conflict_behavior == "fail":
+            if existing_file is not None and conflict_behavior == "fail":
                 raise FileAlreadyExistError(
                     f"Ja existe um arquivo chamado {local_file.name} na pasta remota {
                         parent.id
                     }."
                 )
-            elif staging_content.conflict_behavior == "rename":
+            if existing_file is not None and conflict_behavior == "rename":
                 # Em modo `rename`, o Core gera um novo nome remoto e tenta a
                 # criacao novamente sob o mesmo pai.
                 remote_name = rename_with_uuid(local_file.name)
-                staging_content = build_upload_content(
-                    local_file.rename_on_disk(remote_name),
-                    remote_name,
-                    conflict_behavior,
-                )
+                should_create = True
+
+            if should_create:
+                # A fronteira de URL valida e codifica somente o nome escolhido
+                # para a requisicao atual.
+                content_fragment = build_create_content_url(remote_name)
                 create_url = build_drive_create_content_url(
                     library.id,
                     parent.id,
-                    staging_content.target_path,
+                    content_fragment,
                 )
                 response = await (
                     self._client_manager.client.drives.by_drive_id(library.id)
@@ -1391,6 +1385,11 @@ class SharePointService:
             else:
                 # Em modo `replace`, o upload usa diretamente o `item_id` do
                 # arquivo existente e substitui apenas o conteudo.
+                if existing_file is None:
+                    raise SmallFileUploadError(
+                        "O upload pequeno entrou no fluxo de substituicao sem "
+                        "um arquivo remoto correspondente."
+                    )
                 response = await (
                     self._client_manager.client.drives.by_drive_id(library.id)
                     .items.by_drive_item_id(existing_file.id)
@@ -1410,8 +1409,8 @@ class SharePointService:
             return FileUploadResult(
                 item=uploaded_item,
                 source_path=local_file.path,
-                conflict_behavior=staging_content.conflict_behavior,
-                remote_name=remote_name,
+                conflict_behavior=conflict_behavior,
+                remote_name=uploaded_item.name or remote_name,
             )
         except (
             NotAFolderError,
@@ -1428,7 +1427,10 @@ class SharePointService:
         ):
             raise
         except ODataError as error:
-            raise parse_o_data_error(error, operation="upload_small_file")
+            raise parse_o_data_error(
+                error,
+                operation="upload_small_file",
+            ) from error
 
     async def _upload_large_file(
         self,
@@ -1462,7 +1464,8 @@ class SharePointService:
         """
         # O endpoint de sessao cria o arquivo como filho de um item pasta.
         if not parent.is_folder:
-            raise NotAFolderError(f"O item {parent.id} nao e uma pasta de destino.")
+            raise NotAFolderError(
+                f"O item {parent.id} nao e uma pasta de destino.")
 
         # As validacoes locais evitam criar uma sessao que nao podera ser
         # usada.
@@ -1491,7 +1494,8 @@ class SharePointService:
                 # ranges e enviar cada trecho do stream.
                 upload_task = LargeFileUploadTask(
                     upload_session=upload_session,
-                    request_adapter=(self._client_manager.client.request_adapter),
+                    request_adapter=(
+                        self._client_manager.client.request_adapter),
                     stream=file_stream,  # type: ignore
                     parsable_factory=DriveItem,
                     max_chunk_size=MAX_CHUNK_SIZE,
@@ -1501,7 +1505,8 @@ class SharePointService:
             # O resultado cru do SDK informa se a task considera o envio
             # concluido.
             if not upload_result.upload_succeeded:
-                raise RuntimeError(f"Upload nao concluido para {local_file.name}")
+                raise RuntimeError(
+                    f"Upload nao concluido para {local_file.name}")
         except LocalPathNotFoundError:
             raise
         except LocalPathIsDirectoryError:
@@ -1570,10 +1575,12 @@ class SharePointService:
         # As propriedades uploadable carregam metadados aplicados ao arquivo
         # remoto quando a sessao for finalizada.
         uploadable_propieties = DriveItemUploadableProperties(
-            additional_data={"@microsoft.graph.conflictBehavior": conflict_behavior}
+            additional_data={
+                "@microsoft.graph.conflictBehavior": conflict_behavior}
         )
 
-        request_body = CreateUploadSessionPostRequestBody(item=uploadable_propieties)
+        request_body = CreateUploadSessionPostRequestBody(
+            item=uploadable_propieties)
 
         # O endereco por path combina o id do pai com o nome do arquivo
         # que sera criado ou resolvido pelo Graph.

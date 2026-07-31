@@ -9,9 +9,23 @@ Exemplo:
     )
 """
 
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
-from core.errors import SharePointUrlError
+from core.errors import InvalidRemoteNameError, SharePointUrlError
+
+INVALID_REMOTE_NAME_CHARACTERS = frozenset('"*:<>?/\\|')
+RESERVED_REMOTE_NAMES = frozenset(
+    {
+        ".lock",
+        "aux",
+        "con",
+        "desktop.ini",
+        "nul",
+        "prn",
+        *(f"com{index}" for index in range(10)),
+        *(f"lpt{index}" for index in range(10)),
+    }
+)
 
 
 def validate_graph_url(url: str, strict_validate: bool = False) -> bool:
@@ -86,9 +100,35 @@ def build_create_content_url(filename: str) -> str:
     """Monta o fragmento Graph usado para criar um arquivo por nome.
 
     O retorno e apenas o sufixo relativo ao item pai, por exemplo
-    `:/curriculo.pdf:/content`.
+    `:/curriculo.pdf:/content`. O nome permanece semantico nas camadas
+    anteriores e recebe percent-encoding somente nesta fronteira de URL.
     """
-    return f":/{filename}:/content"
+    if not filename or filename != filename.strip():
+        raise InvalidRemoteNameError(
+            "O nome remoto do arquivo nao pode ser vazio nem conter espacos "
+            "nas extremidades."
+        )
+    if filename.endswith("."):
+        raise InvalidRemoteNameError(
+            f"O nome remoto do arquivo nao pode terminar com ponto: {filename}."
+        )
+    if any(character in INVALID_REMOTE_NAME_CHARACTERS for character in filename):
+        raise InvalidRemoteNameError(
+            f"O nome remoto do arquivo contem caracteres proibidos: {filename}."
+        )
+
+    normalized_name = filename.casefold()
+    if normalized_name in RESERVED_REMOTE_NAMES:
+        raise InvalidRemoteNameError(
+            f"O nome remoto do arquivo e reservado pelo SharePoint: {filename}."
+        )
+    if normalized_name.startswith("~$") or "_vti_" in normalized_name:
+        raise InvalidRemoteNameError(
+            f"O nome remoto do arquivo e reservado pelo SharePoint: {filename}."
+        )
+
+    encoded_filename = quote(filename, safe="")
+    return f":/{encoded_filename}:/content"
 
 
 def build_drive_create_content_url(

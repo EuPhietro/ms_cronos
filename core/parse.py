@@ -152,7 +152,7 @@ def parse_local_file(path: Path | str) -> LocalFile:
     return LocalFile(
         path=path,
         name=path.name,
-        extension=path.suffix or None,
+        extension=path.suffix,
         size=path.stat().st_size,
     )
 

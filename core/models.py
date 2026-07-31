@@ -10,9 +10,9 @@ Este modulo concentra:
 A ideia e que o restante do projeto dependa destes tipos em vez de consumir
 objetos crus do SDK do Microsoft Graph.
 
-O fluxo planejado para diretorios possui duas representacoes:
+O fluxo de diretorios possui duas representacoes:
 - `FilesystemTree` descreve fielmente o que o scanner encontrou no disco;
-- `StagingFilesystemTree` descrevera o que esta preparado para ser enviado.
+- `StagingFilesystemTree` descreve o que foi preparado para envio.
 
 Exemplo basico:
     credentials = GraphCredentials(
@@ -33,94 +33,83 @@ Exemplo basico:
     assert sites.first() == site
 """
 
-# TODO(directory-upload): concluir o pipeline de preparacao de diretorios.
-#
-# Fluxo esperado:
-#
-#    LocalFilesystemScanner
-#        -> FilesystemTree
-#        -> conversor/builder de staging
-#        -> StagingFilesystemTree
-#        -> servico de upload
-#
-# O scanner deve somente inspecionar o disco e montar `FilesystemTree`. Ele nao
-# deve conhecer bibliotecas, itens remotos, conflito de nomes ou chamadas ao
-# Microsoft Graph.
-#
-# 1. Concluir o contrato do snapshot local:
-#
-#    - adicionar `relative_path: Path` a `DirectoryLevel`, ou documentar uma
-#      operacao equivalente em `FilesystemTree`;
-#    - calcular o tamanho de cada nivel somente com seus arquivos diretos;
-#    - derivar tamanho e contadores totais a partir de `levels`;
-#    - preservar diretorios vazios;
-#    - manter arquivos vazios invalidos por padrao e representa-los somente
-#      quando a politica explicita `allow_empty="allow"` for usada;
-#    - preservar a ordem top-down produzida por `Path.walk()`.
-#
-# 2. Implementar os modelos de staging. Eles representam recursos locais ja
-#    associados ao destino remoto e prontos para consumo pelo uploader:
-#
-#    @dataclass(frozen=True)
-#    class StagingFile(CollectionItem):
-#        source: LocalFile
-#        target_path: str
-#        conflict_behavior: ConflictBehavior
-#
-#    @dataclass(frozen=True)
-#    class StagingFolder(CollectionItem):
-#        source: LocalFolder
-#        target_path: str
-#
-#    `target_path` deve ser um fragmento remoto relativo, nunca uma URL completa
-#    do Graph nem um caminho absoluto do computador local.
-#
-#    @dataclass(frozen=True)
-#    class StagingFileCollection(FrozenCollection[StagingFile]):
-#        pass
-#
-#    @dataclass(frozen=True)
-#    class StagingFolderCollection(FrozenCollection[StagingFolder]):
-#        pass
-#
-#    @dataclass(frozen=True)
-#    class StagingDirectoryLevel(CollectionItem):
-#        source: DirectoryLevel
-#        target_path: str
-#        files: StagingFileCollection
-#        folders: StagingFolderCollection
-#
-#    @dataclass(frozen=True)
-#    class StagingDirectoryLevelCollection(
-#        FrozenCollection[StagingDirectoryLevel]
-#    ):
-#        pass
-#
-#    @dataclass(frozen=True)
-#    class StagingFilesystemTree:
-#        source: FilesystemTree
-#        library: DocumentLibrary
-#        destination: SharePointItem
-#        levels: StagingDirectoryLevelCollection
-#
-# 3. Implementar o conversor/builder que recebe `FilesystemTree`, biblioteca,
-#    pasta remota inicial e politica de conflito, validando todos os caminhos
-#    antes de produzir `StagingFilesystemTree`.
-#
-# 4. Decidir se `StagingFile` substituira `PreparedUpload` ou se o reutilizara
-#    por composicao. Os dois modelos nao devem manter contratos concorrentes
-#    para o mesmo arquivo preparado.
-#
-# 5. Manter `LocalFile`, `LocalFolder`, `DirectoryLevel` e `FilesystemTree`
-#    independentes do SharePoint. Somente os modelos `Staging*` devem conhecer
-#    destino remoto e politica de upload.
 
+# TODO(staging-tree): concluir os models da arvore preparada.
+#
+# Fluxo:
+#
+#    LocalFileSystemScanner
+#        -> FilesystemTree
+#        -> StagingService
+#        -> StagingFilesystemTree
+#
+# Contrato definido:
+#
+#    - a arvore de staging preserva exatamente a topologia da arvore local;
+#    - `relative_path: Path` posiciona um recurso em relacao a
+#      `FilesystemTree.root.path`;
+#    - o nivel raiz usa `Path(".")`;
+#    - `target_root: PurePosixPath` e o fragmento remoto colocado sob o pai
+#      remoto que sera fornecido posteriormente ao executor;
+#    - `target_root=PurePosixPath(".")` copia os filhos da raiz local
+#      diretamente para o pai remoto;
+#    - outro `target_root`, como `PurePosixPath("Importacoes")`, recria a arvore
+#      dentro desse fragmento;
+#    - `target_path` e sempre derivado, nunca uma decisao independente:
+#
+#          target_path = target_root / PurePosixPath(relative_path.as_posix())
+#
+#    - os fragmentos permanecem decodificados nos models; percent-encoding e
+#      montagem de URL pertencem a `core.urls`.
+#
+# Pendencias:
+#
+# 1. Declarar `target_root` como field tipado de `StagingFilesystemTree`:
+#
+#        target_root: PurePosixPath = PurePosixPath(".")
+#
+# 2. Remover `target_path` como entrada independente de `StagingFile`,
+#    `StagingFolder` e `StagingDirectoryLevel`, ou garantir sua derivacao em um
+#    unico ponto da arvore. Nao permitir que o chamador forneca combinacoes
+#    divergentes de `target_root`, `relative_path` e `target_path`.
+#
+# 3. Revisar os `__post_init__`:
+#
+#    - validar a origem com `Path.is_file()` ou `Path.is_dir()`;
+#    - rejeitar `relative_path` absoluto ou contendo `..`;
+#    - nao resolver `relative_path` contra o diretorio de trabalho;
+#    - validar cada segmento remoto segundo as regras do SharePoint;
+#    - rejeitar URLs completas e fragmentos remotos contendo `..`;
+#    - preservar nomes e extensoes sem aplicar percent-encoding;
+#    - usar erros locais especificos em vez de erros de busca remota.
+#
+# 4. Implementar em `StagingFilesystemTree` uma operacao pura para resolver o
+#    destino de qualquer fragmento:
+#
+#        resolve_target_path(relative_path: Path) -> PurePosixPath
+#
+# 5. Implementar as propriedades derivadas `total_files`, `total_folders`,
+#    `total_levels` e `total_size`, sem armazenar contadores duplicados.
+#
+# 6. Implementar `StagingService` como transformador deterministico:
+#
+#    StagingService.build_tree(
+#        tree: FilesystemTree,
+#        target_root: PurePosixPath = PurePosixPath("."),
+#        conflict_behavior: ConflictBehavior = "fail",
+#    ) -> StagingFilesystemTree
+#
+#    O transformador deve preservar a ordem top-down, diretorios vazios e toda
+#    a estrutura relativa, sem abrir arquivos, carregar bytes, acessar a rede
+#    ou alterar o filesystem local.
+#
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from multiprocessing import Value
+from pathlib import Path, PurePosixPath
 from typing import (
     ClassVar,
     Generic,
@@ -131,12 +120,20 @@ from typing import (
     overload,
 )
 
+from core.errors import (
+    InvalidRemoteNameError,
+    LocalPathError,
+    LocalPathIsDirectoryError,
+    LocalPathNotFoundError,
+)
+
 # `T` representa o tipo de item armazenado por uma colecao generica.
 T = TypeVar("T")
 
 # Politica de conflito aceita pelas operacoes de criacao e upload.
 ConflictBehavior = Literal["fail", "rename", "replace"]
 
+RootUploadMode = Literal['include_root','contents_only']
 
 # `CollectionItem` permanece como classe base semantica para identificar os
 # modelos que podem viver dentro das colecoes do Core.
@@ -275,6 +272,7 @@ class Collection_(Generic[T], ABC):
     _storage_factory: ClassVar[Callable[[Iterable[object]], Sequence[object]]]
 
     def __init__(self) -> None:
+        """Declara o armazenamento que sera definido pela subclasse concreta."""
         # `_slots` e o armazenamento interno compartilhado por todas as
         # colecoes. Cada subclasse define se ele sera tupla ou lista.
         self._slots: Sequence[T]
@@ -470,6 +468,7 @@ class RootFolder:
     name: str
 
     def __post_init__(self):
+        """Valida a existencia da raiz e a correspondencia de seu nome."""
         assert self.path.exists(), (
             f"O caminho passado não é válido self.path.exists(): {self.path.exists()}"
         )
@@ -479,6 +478,7 @@ class RootFolder:
 
     @classmethod
     def from_uri(cls, path: str | Path) -> Self:
+        """Constroi a raiz a partir de um caminho local."""
         resolved_path = Path(path)
         return cls(
             path=resolved_path,
@@ -491,7 +491,7 @@ class RootFolder:
 
 @dataclass(frozen=True)
 class LocalFolder(CollectionItem):
-    """Referencia enxuta de um subdiretorio encontrado no disco.
+    """Referencia enxuta e opaca de um subdiretorio encontrado no disco.
 
     O modelo descreve somente o recurso local. Sua correspondencia com uma
     pasta remota sera responsabilidade futura de `StagingFolder`.
@@ -504,6 +504,7 @@ class LocalFolder(CollectionItem):
     name: str
 
     def __post_init__(self):
+        """Valida a existencia da pasta e a correspondencia de seu nome."""
         assert self.path.exists(), (
             f"O caminho passado não é válido self.path.exists(): {self.path.exists()}"
         )
@@ -513,6 +514,7 @@ class LocalFolder(CollectionItem):
 
     @classmethod
     def from_uri(cls, path: str | Path) -> Self:
+        """Constroi uma referencia de pasta a partir de um caminho local."""
         resolved_path = Path(path)
         return cls(
             path=resolved_path,
@@ -539,6 +541,7 @@ class LocalFile(CollectionItem):
     allow_empty: Literal["allow", "deny"] = "deny"
 
     def __post_init__(self):
+        """Valida metadados e aplica a politica para arquivos vazios."""
         assert self.path.exists(), (
             f"O caminho passado não é válido self.path.exists(): {self.path.exists()}"
         )
@@ -618,6 +621,7 @@ class DirectoryLevel(CollectionItem):
 
     @property
     def total_size(self) -> int:
+        """Soma os bytes dos arquivos diretamente contidos no nivel."""
         total = 0
         for file in self.files:
             total += file.size
@@ -626,10 +630,12 @@ class DirectoryLevel(CollectionItem):
 
     @property
     def total_files(self) -> int:
+        """Retorna a quantidade de arquivos diretamente contidos."""
         return len(self.files)
 
     @property
     def total_directories(self) -> int:
+        """Retorna a quantidade de subdiretorios diretamente contidos."""
         return len(self.folders)
 
 
@@ -639,10 +645,12 @@ class DirectoryLevelCollection(FrozenCollection[DirectoryLevel]):
 
     @property
     def total_size(self) -> int:
+        """Soma os bytes registrados em todos os niveis da colecao."""
         return sum(level.total_size for level in self)
 
     @property
     def total_files(self) -> int:
+        """Soma os arquivos registrados em todos os niveis."""
         return sum(level.total_files for level in self)
 
 
@@ -663,7 +671,7 @@ class FilesystemTree:
     levels: DirectoryLevelCollection
 
     def __post_init__(self):
-
+        """Confirma que os recursos do snapshot ainda existem no disco."""
         assert self.root.path.exists()
 
         for level in self.levels:
@@ -675,47 +683,218 @@ class FilesystemTree:
 
     @property
     def total_size(self) -> int:
+        """Retorna o tamanho total dos arquivos registrados, em bytes."""
         return self.levels.total_size
 
     @property
     def total_files(self) -> int:
+        """Retorna a quantidade total de arquivos registrados."""
         return self.levels.total_files
 
     @property
     def total_levels(self) -> int:
+        """Retorna a quantidade de diretorios materializados como niveis."""
         return len(self.levels)
 
     @property
     def total_subdirectories(self) -> int:
+        """Soma as referencias de subdiretorios imediatos de todos os niveis."""
         return sum(level.total_directories for level in self.levels)
 
 
-# Os modelos locais acima registram o snapshot do disco. Os modelos `Staging*`
-# descritos no TODO do modulo formarao, posteriormente, o plano semantico de
-# upload para o SharePoint.
+# Os modelos locais acima descrevem o snapshot observado no disco. Os modelos
+# abaixo acrescentam caminhos relativos e destinos para formar o plano
+# semantico que sera consumido pelo futuro orquestrador de upload.
 
 
 @dataclass(frozen=True)
-class PreparedUpload(CollectionItem):
-    """Representa um upload pequeno ja preparado para envio.
+class StagingFile(CollectionItem):
+    """Representa um arquivo local preparado para envio.
 
-    O objeto guarda:
-    - o arquivo local de origem;
-    - o fragmento de path Graph que identifica o recurso de criacao;
-    - a estrategia semantica de conflito pedida pelo chamador.
+    `source` preserva a referencia local original. `relative_path` posiciona o
+    arquivo dentro da arvore escaneada. O `target_path` materializado deve ser
+    derivado do `target_root` da arvore somado a esse caminho relativo;
+    portanto, nao pode representar uma reorganizacao independente.
+    `remote_name` registra o nome usado no SharePoint, e
+    `conflict_behavior` define a estrategia para colisao.
+
+    O model armazena apenas metadados. O conteudo binario continua no arquivo
+    local e so deve ser aberto durante a execucao do upload. Seus fragmentos
+    permanecem decodificados; a camada de URL aplicara percent-encoding.
     """
 
-    file: LocalFile
-    target_path: str
+    source: LocalFile  # Arquivo local que sera enviado.
+    relative_path: Path  # Caminho relativo a raiz do `FilesystemTree`.
+    remote_name: str  # Nome final planejado para o recurso remoto.
     conflict_behavior: ConflictBehavior = "fail"
 
+    def __post_init__(self):
+        """Valida a origem e os metadados essenciais do staging."""
+        if not self.source.path.exists():
+            raise LocalPathNotFoundError(
+                "O arquivo local preparado para staging nao foi encontrado: "
+                f"{self.source.path}."
+            )
+        if not self.source.path.is_file():
+            if self.source.path.is_dir():
+                raise LocalPathIsDirectoryError(
+                    "O staging esperava um arquivo, mas o caminho local aponta "
+                    f"para um diretorio: {self.source.path}."
+                )
+            raise LocalPathError(
+                "O caminho local preparado para staging nao representa um "
+                f"arquivo regular: {self.source.path}."
+            )
+        if self.relative_path.is_absolute():
+            raise LocalPathError(
+                "O relative_path do arquivo deve ser relativo a raiz da "
+                f"arvore, mas foi recebido um caminho absoluto: "
+                f"{self.relative_path}."
+            )
+        if ".." in self.relative_path.parts:
+            raise LocalPathError(
+                "O relative_path do arquivo nao pode sair da raiz da arvore "
+                f"usando '..': {self.relative_path}."
+            )
+        if not self.remote_name.strip():
+            raise InvalidRemoteNameError(
+                "O nome remoto do arquivo nao pode ser vazio ou conter apenas "
+                f"espacos. Origem local: {self.source.path}."
+            )
 
-@dataclass
-class PreparedUploadCollection(MutableCollection[PreparedUpload]):
-    """Colecao mutavel de uploads pequenos ja preparados para envio.
 
-    Exemplo:
-        staged = PreparedUploadCollection(_slots=[staging_content])
-        staged.clear()
-        assert staged.is_empty
+@dataclass(frozen=True)
+class StagingFolder(CollectionItem):
+    """Representa uma pasta local preparada para criacao remota.
+
+    A origem permanece em `source`; `relative_path` preserva sua posicao na
+    arvore local. O `target_path`, quando materializado, deve corresponder ao
+    `target_root` da arvore somado a esse fragmento. `remote_name` preserva o
+    nome planejado sem codificacao de URL. O model nao representa uma pasta
+    remota ja criada.
     """
+
+    source: LocalFolder
+    relative_path: Path
+    remote_name: str
+
+    def __post_init__(self):
+        """Valida a origem e os metadados essenciais do staging da pasta."""
+        if not self.source.path.exists():
+            raise LocalPathNotFoundError(
+                "A pasta local preparada para staging nao foi encontrada: "
+                f"{self.source.path}."
+            )
+        if not self.source.path.is_dir():
+            raise LocalPathError(
+                "O staging esperava uma pasta, mas o caminho local nao "
+                f"representa um diretorio: {self.source.path}."
+            )
+        if self.relative_path.is_absolute():
+            raise LocalPathError(
+                "O relative_path da pasta deve ser relativo a raiz da arvore, "
+                f"mas foi recebido um caminho absoluto: {self.relative_path}."
+            )
+        if ".." in self.relative_path.parts:
+            raise LocalPathError(
+                "O relative_path da pasta nao pode sair da raiz da arvore "
+                f"usando '..': {self.relative_path}."
+            )
+        if not self.remote_name.strip():
+            raise InvalidRemoteNameError(
+                "O nome remoto da pasta nao pode ser vazio ou conter apenas "
+                f"espacos. Origem local: {self.source.path}."
+            )
+
+
+@dataclass(frozen=True)
+class StagingFileCollection(FrozenCollection[StagingFile]):
+    """Colecao imutavel de arquivos preparados para upload."""
+
+
+@dataclass(frozen=True)
+class StagingFolderCollection(FrozenCollection[StagingFolder]):
+    """Colecao imutavel de pastas preparadas para criacao remota."""
+
+
+@dataclass(frozen=True)
+class StagingDirectoryLevel(CollectionItem):
+    """Representa o plano de envio do conteudo imediato de um diretorio.
+
+    `source` aponta para o nivel observado pelo scanner. As colecoes de staging
+    guardam somente os arquivos e subdiretorios imediatos desse nivel;
+    descendentes mais profundos aparecem em outros itens da colecao de niveis.
+    A estrutura remota preserva essa mesma hierarquia: `target_path` deve ser
+    derivado do `target_root` da arvore e de `relative_path`.
+    """
+
+    source: DirectoryLevel
+    relative_path: Path
+    staging_files: StagingFileCollection
+    staging_folders: StagingFolderCollection
+
+    def __post_init__(self):
+        """Valida a natureza relativa dos fragmentos local e remoto."""
+        if not self.source.path.exists():
+            raise LocalPathNotFoundError(
+                "O diretorio local representado pelo nivel de staging nao foi "
+                f"encontrado: {self.source.path}."
+            )
+        if not self.source.path.is_dir():
+            raise LocalPathError(
+                "O nivel de staging deve representar um diretorio local, mas "
+                f"recebeu: {self.source.path}."
+            )
+        if self.relative_path.is_absolute():
+            raise LocalPathError(
+                "O relative_path do nivel deve ser relativo a raiz da arvore, "
+                f"mas foi recebido um caminho absoluto: {self.relative_path}."
+            )
+        if ".." in self.relative_path.parts:
+            raise LocalPathError(
+                "O relative_path do nivel nao pode sair da raiz da arvore "
+                f"usando '..': {self.relative_path}."
+            )
+
+@dataclass(frozen=True)
+class StagingDirectoryLevelCollection(FrozenCollection[StagingDirectoryLevel]):
+    """Colecao imutavel dos niveis preparados para percurso top-down."""
+
+
+@dataclass(frozen=True)
+class StagingFilesystemTree:
+    """Representa o plano completo de upload de uma arvore local.
+
+    `source` preserva o snapshot local. `target_root` e um fragmento remoto
+    relativo ao pai que o executor recebera posteriormente, nao um item remoto
+    nem uma URL. O valor `"."` significa copiar os filhos da raiz local
+    diretamente para esse pai; outro fragmento cria um prefixo para toda a
+    estrutura.
+
+    `levels` mantem o trabalho preparado em ordem top-down. Para qualquer
+    nivel ou recurso, o destino e derivado por:
+
+        target_path = target_root / relative_path
+
+    A politica de conflito funciona como padrao para os arquivos da arvore.
+    Nenhum fragmento deste model deve estar percent-encoded.
+    """
+
+    source: FilesystemTree
+    levels: StagingDirectoryLevelCollection
+    conflict_behavior: ConflictBehavior = "fail"
+    # `"."` copia os filhos diretamente para a raiz remota recebida.
+    target_root: PurePosixPath = PurePosixPath(".")
+
+    def __post_init__(self):
+        """Valida o fragmento remoto usado como raiz da arvore preparada."""
+        if self.target_root.is_absolute():
+            raise InvalidRemoteNameError(
+                "target_root deve ser um fragmento remoto relativo ao pai, "
+                f"mas foi recebido um caminho absoluto: {self.target_root}."
+            )
+        if ".." in self.target_root.parts:
+            raise InvalidRemoteNameError(
+                "target_root nao pode sair do pai remoto usando '..': "
+                f"{self.target_root}."
+            )
