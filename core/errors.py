@@ -253,6 +253,27 @@ class UploadError(MSCronosError):
         super().__init__(*args)
 
 
+class TreeUploadError(UploadError):
+    """Use como erro base da materializacao e do upload de uma arvore."""
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+
+class TreeDirectoryCreationError(TreeUploadError):
+    """Use quando um nivel da arvore nao puder ser resolvido ou criado."""
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+
+class TreeFileUploadError(TreeUploadError):
+    """Use quando um arquivo falhar durante o upload sequencial da arvore."""
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+
 class SmallFileUploadError(UploadError):
     """Use quando falhar o fluxo de upload simples de arquivo pequeno,
     normalmente feito com PUT direto no endpoint de content."""

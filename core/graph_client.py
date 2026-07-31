@@ -34,20 +34,19 @@ class GraphClientManager:
     def __init__(
         self,
         credentials: GraphCredentials,
-        scopes: Sequence[str] | None = None,
+        scopes: str | Sequence[str] | None = None,
     ) -> None:
-        # O manager preserva o contrato de entrada para que outras camadas
-        # possam inspecionar credenciais e scopes sem recriar o client.
         self._credentials = credentials
-        self._scopes = tuple(scopes or DEFAULT_SCOPES)
+        if scopes is None:
+            self._scopes = DEFAULT_SCOPES
+        elif isinstance(scopes, str):
+            self._scopes = (scopes,)
+        else:
+            self._scopes = tuple(scopes)
 
-        # Falhas de configuracao devem acontecer cedo, antes da criacao da
-        # credencial assincrona do Azure e do client Graph.
         self._validate_credentials(credentials)
         self._validate_scopes(self._scopes)
 
-        # A credencial e o client ficam encapsulados no manager para permitir
-        # fechamento controlado e uso com `async with`.
         self._credential = ClientSecretCredential(
             tenant_id=credentials.tenant_id,
             client_id=credentials.client_id,
@@ -65,7 +64,10 @@ class GraphClientManager:
     def client(self) -> GraphServiceClient:
         """Retorna o `GraphServiceClient` enquanto o manager estiver aberto."""
         if self._closed:
-            raise RuntimeError("Graph client manager is closed.")
+            raise RuntimeError(
+                "O cliente do Microsoft Graph nao pode ser usado depois que "
+                "o GraphClientManager foi fechado."
+            )
         return self._client
 
     @property
@@ -95,29 +97,27 @@ class GraphClientManager:
 
     @staticmethod
     def _validate_credentials(credentials: GraphCredentials) -> None:
-        # O Core exige strings nao vazias para evitar erros obscuros mais tarde
-        # na autenticacao remota.
         if not credentials.client_id.strip():
-            raise ValueError("GraphCredentials.client_id cannot be empty.")
+            raise ValueError("GraphCredentials.client_id nao pode ser vazio.")
         if not credentials.client_secret.strip():
-            raise ValueError("GraphCredentials.secrets_token cannot be empty.")
+            raise ValueError("GraphCredentials.client_secret nao pode ser vazio.")
         if not credentials.tenant_id.strip():
-            raise ValueError("GraphCredentials.tenant_id cannot be empty.")
+            raise ValueError("GraphCredentials.tenant_id nao pode ser vazio.")
 
     @staticmethod
     def _validate_scopes(scopes: Sequence[str]) -> None:
-        # Scopes vazios quebrariam a construcao do client e precisam ser
-        # rejeitados antes de qualquer chamada remota.
         if not scopes:
-            raise ValueError("At least one scope must be provided.")
+            raise ValueError("Informe ao menos um scope do Microsoft Graph.")
         for scope in scopes:
             if not isinstance(scope, str) or not scope.strip():
-                raise ValueError("Scopes must be non-empty strings.")
+                raise ValueError(
+                    "Cada scope do Microsoft Graph deve ser uma string nao vazia."
+                )
 
 
 def create_graph_client_manager(
     credentials: GraphCredentials,
-    scopes: Sequence[str] | None = None,
+    scopes: str | Sequence[str] | None = None,
 ) -> GraphClientManager:
     """Cria um `GraphClientManager` com os scopes informados ou os padroes."""
     return GraphClientManager(credentials=credentials, scopes=scopes)
@@ -125,7 +125,7 @@ def create_graph_client_manager(
 
 def create_graph_client(
     credentials: GraphCredentials,
-    scopes: Sequence[str] | None = None,
+    scopes: str | Sequence[str] | None = None,
 ) -> GraphClientManager:
     """Alias de compatibilidade para criar o manager do Graph."""
     return create_graph_client_manager(credentials=credentials, scopes=scopes)

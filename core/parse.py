@@ -65,10 +65,11 @@ def parse_site(site: Site) -> SharePointSite:
     O `id` e obrigatorio porque as proximas chamadas ao Graph dependem dele
     para navegar por drives e itens.
     """
-    # O parser unitario adapta o model cru do SDK para a referencia enxuta
-    # usada pelo Core.
     if not site.id:
-        raise GraphResponseError("A resposta do Graph nao trouxe um site resolvido.")
+        raise GraphResponseError(
+            "Nao foi possivel converter a resposta do Graph em SharePointSite: "
+            "o campo 'id' esta ausente."
+        )
 
     return SharePointSite(
         id=site.id,
@@ -84,13 +85,15 @@ def adapt_site(additional_data: dict[str, Any]) -> SharePointSite:
     A rota `sites.with_url(...).get()` pode devolver os campos do site nesse
     dicionario, em vez de preencher `response.value`.
     """
-    # O fallback usa nomes exatamente como o Graph envia em `additional_data`.
     id = additional_data.get("id")
     name = additional_data.get("name")
     display_name = additional_data.get("displayName")
     web_url = additional_data.get("webUrl")
     if not id:
-        raise GraphResponseError("A resposta do Graph nao trouxe um site resolvido.")
+        raise GraphResponseError(
+            "Nao foi possivel adaptar additional_data para SharePointSite: "
+            "o campo 'id' esta ausente."
+        )
     return SharePointSite(id, name, display_name, web_url)
 
 
@@ -100,10 +103,11 @@ def parse_drive(drive: Drive) -> DocumentLibrary:
     `DocumentLibrary` representa uma document library ou drive que pode ser usado nas
     rotas `/drives/{drive-id}/...`.
     """
-    # Drives do SDK carregam muitos detalhes; aqui o Core retira apenas o
-    # contrato minimo que sera reutilizado nas proximas operacoes.
     if not drive.id:
-        raise GraphResponseError("A resposta do Graph nao trouxe um drive valido.")
+        raise GraphResponseError(
+            "Nao foi possivel converter a resposta do Graph em "
+            "DocumentLibrary: o campo 'id' esta ausente."
+        )
 
     return DocumentLibrary(
         id=drive.id,
@@ -119,11 +123,10 @@ def parse_drive_item(drive_item: DriveItem) -> SharePointItem:
     O Graph usa o mesmo model para arquivos e pastas. O Core preserva essa
     distincao nos flags `is_folder` e `is_file`.
     """
-    # A presenca das facets `folder` e `file` e o que permite distinguir com
-    # seguranca se o item representa uma pasta ou um arquivo.
     if not drive_item.id:
         raise GraphResponseError(
-            "A resposta do Graph nao trouxe um item de drive valido."
+            "Nao foi possivel converter a resposta do Graph em "
+            "SharePointItem: o campo 'id' esta ausente."
         )
 
     return SharePointItem(
@@ -142,8 +145,6 @@ def parse_local_file(path: Path | str) -> LocalFile:
     Diferente de `LocalFile.from_uri`, este parser valida que o caminho existe
     e aponta para arquivo antes de devolver o model interno.
     """
-    # A validacao antecipada produz um erro semantico quando o caminho nao
-    # representa um arquivo. As invariantes restantes pertencem ao model.
     path = Path(path)
 
     if not path.is_file():
@@ -165,10 +166,10 @@ def parse_site_collection_response(
     Use quando a resposta esperada for uma colecao real de sites, nao a rota
     especial `sites.with_url(...)`, que pode exigir `adapt_site`.
     """
-    # Os envelopes de colecao do SDK chegam com `value`; o Core transforma cada
-    # item e no final materializa a colecao semantica concreta.
     if not site_collection_response.value:
-        raise GraphResponseError("A resposta do Graph nao trouxe sites resolvidos.")
+        raise GraphResponseError(
+            "A resposta de sites do Graph nao contem itens no campo 'value'."
+        )
 
     site_ref_collection = [parse_site(site) for site in site_collection_response.value]
     return SharePointSiteCollection.from_collection(site_ref_collection)
@@ -178,10 +179,10 @@ def parse_drive_collection_response(
     drive_collection_response: DriveCollectionResponse,
 ) -> DocumentLibraryCollection:
     """Converte um envelope de drives do SDK em `DocumentLibraryCollection`."""
-    # O fluxo aqui e o mesmo de sites: validar o envelope, adaptar cada drive e
-    # reconstruir a colecao concreta do Core.
     if not drive_collection_response.value:
-        raise GraphResponseError("A resposta do Graph nao trouxe drives resolvidos.")
+        raise GraphResponseError(
+            "A resposta de bibliotecas do Graph nao contem itens no campo 'value'."
+        )
 
     drive_ref_collection = [
         parse_drive(drive) for drive in drive_collection_response.value

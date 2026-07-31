@@ -59,15 +59,17 @@ class LocalFileSystemScanner:
             OSError: Quando algum nivel nao pode ser lido.
         """
         if isinstance(root, str) and not root.strip():
-            raise ValueError("O parâmetro path não pode ser uma str vazia")
+            raise ValueError("A raiz da varredura nao pode ser uma string vazia.")
 
         root = Path(root).resolve()
 
         if not root.exists():
-            raise ValueError("O caminho não aponta para um caminho válido")
+            raise ValueError(f"A raiz da varredura nao existe: '{root}'.")
 
         if not root.is_dir():
-            raise NotADirectoryError("O caminho não aponta para um diretório")
+            raise NotADirectoryError(
+                f"A raiz da varredura deve ser um diretorio: '{root}'."
+            )
 
         root_folder = RootFolder(path=root, name=root.name)
 

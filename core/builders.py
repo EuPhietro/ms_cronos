@@ -21,7 +21,8 @@ def normalize_conflict_behavior(conflict_behavior: str) -> ConflictBehavior:
     normalized_behavior = conflict_behavior.strip().casefold()
     if normalized_behavior not in ALLOWED_CONFLICT_BEHAVIORS:
         raise InvalidConflictBehaviorError(
-            "Conflict behavior invalido. Use 'fail', 'rename' ou 'replace'."
+            f"Comportamento de conflito invalido: {conflict_behavior!r}. "
+            "Use 'fail', 'rename' ou 'replace'."
         )
     return cast(ConflictBehavior, normalized_behavior)
 
@@ -33,7 +34,7 @@ def _normalize_remote_name(name: str) -> str:
         raise InvalidRemoteNameError("O nome remoto nao pode ser vazio.")
     if "/" in normalized_name or "\\" in normalized_name:
         raise InvalidRemoteNameError(
-            f"O nome remoto deve ser um nome simples, nao um caminho: {name}"
+            f"O nome remoto deve ser um nome simples, nao um caminho: {name!r}."
         )
     return normalized_name
 
@@ -47,8 +48,6 @@ def build_folder_drive_item(
     O Graph espera um `DriveItem` com `name`, a facet `folder` e o valor
     especial `@microsoft.graph.conflictBehavior` em `additional_data`.
     """
-    # Pastas remotas sao criadas por body JSON, entao o builder entrega o model
-    # do SDK pronto para `children.post(...)`.
     folder_name = _normalize_remote_name(name)
     normalized_behavior = normalize_conflict_behavior(conflict_behavior)
 

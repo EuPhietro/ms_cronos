@@ -76,18 +76,16 @@ class StagingTreeBuilder:
             InvalidRemoteNameError: Se ``target_root`` contiver um segmento
                 remoto invalido.
         """
-        # A arvore externa conserva o snapshot de origem; seus niveis recebem
-        # somente as representacoes relativas necessarias ao futuro upload.
-
-        if target_root != PurePosixPath("."): # Corrigido 
-             for segment in target_root.parts:
+        if target_root != PurePosixPath("."):
+            for segment in target_root.parts:
                 if not segment.strip():
                     raise InvalidRemoteNameError(
-                        f"O segmento {segment!r} nao representa um caminho valido."
+                        f"O destino remoto contem um segmento vazio: '{target_root}'."
                     )
                 if segment.endswith("."):
                     raise InvalidRemoteNameError(
-                        f"O segmento remoto {segment!r} nao pode terminar com ponto."
+                        "Um segmento do destino remoto nao pode terminar com "
+                        f"ponto: '{segment}'."
                     )
         return StagingFilesystemTree(
             source=tree,
@@ -115,8 +113,6 @@ class StagingTreeBuilder:
             Colecao imutavel que preserva a ordem dos niveis de origem.
         """
 
-        # Cada nivel e independente na representacao plana; a hierarquia e
-        # recuperada posteriormente por meio de seu caminho relativo.
         return StagingDirectoryLevelCollection.from_collection(
             [
                 self._build_staging_directory_level(
@@ -147,8 +143,6 @@ class StagingTreeBuilder:
             Nivel de staging com arquivos e pastas imediatos preparados.
         """
 
-        # O caminho do proprio nivel e a chave logica que permitira localizar
-        # seu futuro diretorio pai na representacao remota.
         return StagingDirectoryLevel(
             source=source,
             relative_path=self._build_relative_path(root, source.path),

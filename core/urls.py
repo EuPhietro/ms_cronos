@@ -39,22 +39,18 @@ def validate_graph_url(url: str, strict_validate: bool = False) -> bool:
     No modo estrito, tambem exige um path explicito e rejeita caminhos que
     aparentam ja apontar para sub-recursos Graph.
     """
-    # URLs vazias ou compostas apenas por espacos nao podem ser resolvidas.
     if not url.strip():
         return False
 
     parts = urlparse(url)
 
-    # O Core exige HTTPS para URLs humanas do SharePoint.
     if parts.scheme != "https":
         return False
 
-    # Sem hostname nao ha tenant SharePoint para resolver.
     if not parts.hostname:
         return False
 
     if strict_validate:
-        # No modo estrito, exigimos path explicito de site.
         if not parts.path:
             return False
         paths_fragments = parts.path.split(":")
@@ -80,10 +76,11 @@ def build_graph_site_url(sharepoint_url: str, strict_validate: bool = False) -> 
     Quando a validacao falha, a funcao levanta SharePointUrlError para que a
     camada de servico nao precise conhecer detalhes do parse.
     """
-    # A validacao fica centralizada para manter o servico livre de detalhes de
-    # parse de URL.
     if not validate_graph_url(sharepoint_url, strict_validate):
-        raise SharePointUrlError
+        raise SharePointUrlError(
+            "A URL do SharePoint deve ser uma URL HTTPS valida com hostname: "
+            f"{sharepoint_url!r}."
+        )
     parts = urlparse(sharepoint_url)
 
     # Sem path, a URL aponta para o site raiz do tenant e o Graph aceita apenas

@@ -33,110 +33,17 @@ Exemplo basico:
     assert sites.first() == site
 """
 
-# TODO(staging-tree): concluir os models da arvore preparada.
-#
-# Fluxo:
-#
-#    LocalFileSystemScanner
-#        -> FilesystemTree
-#        -> StagingService
-#        -> StagingFilesystemTree
-#
-# Contrato definido:
-#
-#    - a arvore de staging preserva exatamente a topologia da arvore local;
-#    - `relative_path: Path` posiciona um recurso em relacao a
-#      `FilesystemTree.root.path`;
-#    - o nivel raiz usa `Path(".")`;
-#    - `target_root: PurePosixPath` e o fragmento remoto colocado sob o pai
-#      remoto que sera fornecido posteriormente ao executor;
-#    - `target_root=PurePosixPath(".")` copia os filhos da raiz local
-#      diretamente para o pai remoto;
-#    - outro `target_root`, como `PurePosixPath("Importacoes")`, recria a arvore
-#      dentro desse fragmento;
-#    - `target_path` e sempre derivado, nunca uma decisao independente:
-#
-#          target_path = target_root / PurePosixPath(relative_path.as_posix())
-#
-#    - os fragmentos permanecem decodificados nos models; percent-encoding e
-#      montagem de URL pertencem a `core.urls`.
-#
-# Pendencias:
-#
-# 1. Declarar `target_root` como field tipado de `StagingFilesystemTree`:
-#
-#        target_root: PurePosixPath = PurePosixPath(".")
-#
-# 2. Remover `target_path` como entrada independente de `StagingFile`,
-#    `StagingFolder` e `StagingDirectoryLevel`, ou garantir sua derivacao em um
-#    unico ponto da arvore. Nao permitir que o chamador forneca combinacoes
-#    divergentes de `target_root`, `relative_path` e `target_path`.
-#
-# 3. Revisar os `__post_init__`:
-#
-#    - validar a origem com `Path.is_file()` ou `Path.is_dir()`;
-#    - rejeitar `relative_path` absoluto ou contendo `..`;
-#    - nao resolver `relative_path` contra o diretorio de trabalho;
-#    - validar cada segmento remoto segundo as regras do SharePoint;
-#    - rejeitar URLs completas e fragmentos remotos contendo `..`;
-#    - preservar nomes e extensoes sem aplicar percent-encoding;
-#    - usar erros locais especificos em vez de erros de busca remota.
-#
-# 4. Implementar em `StagingFilesystemTree` uma operacao pura para resolver o
-#    destino de qualquer fragmento:
-#
-#        resolve_target_path(relative_path: Path) -> PurePosixPath
-#
-# 5. Implementar as propriedades derivadas `total_files`, `total_folders`,
-#    `total_levels` e `total_size`, sem armazenar contadores duplicados.
-#
-# 6. Implementar `StagingTreeBuilder` como transformador deterministico:
-#
-#    StagingTreeBuilder.build_tree(
-#        tree: FilesystemTree,
-#        target_root: PurePosixPath = PurePosixPath("."),
-#        conflict_behavior: ConflictBehavior = "fail",
-#    ) -> StagingFilesystemTree
-#
-#    O transformador deve preservar a ordem top-down, diretorios vazios e toda
-#    a estrutura relativa, sem abrir arquivos, carregar bytes, acessar a rede
-#    ou alterar o filesystem local.
-#
-# 7. Primeira entrega: implementar em `SharePointService` uma versao inicial e
-#    sequencial do upload da arvore. O fluxo deve criar ou resolver todos os
-#    diretorios em ordem top-down e, em uma segunda passagem, enviar os
-#    arquivos usando o `upload()` individual ja existente.
-#
-# Evolucao posterior a primeira versao funcional:
-#
-# 8. Modelar a arvore de diretorios materializada no SharePoint com contratos
-#    semanticos como `RemoteDirectoryLevel` e `RemoteDirectoryTree`.
-#
-# 9. A arvore remota deve preservar a ordem top-down em uma colecao interna e
-#    manter um indice auxiliar `dict[PurePosixPath, int]`. O indice aponta para
-#    a posicao do nivel na colecao, permitindo resolver o pai remoto de cada
-#    arquivo sem percorrer toda a arvore.
-#
-# 10. Expor navegacao semelhante a um mapping por dunder methods:
-#
-#        __getitem__(relative_path) -> RemoteDirectoryLevel
-#        __contains__(relative_path) -> bool
-#        __iter__() -> Iterator[RemoteDirectoryLevel]
-#        __len__() -> int
-#
-#     O acesso posicional deve permanecer explicito, por exemplo `at(index)`,
-#     para nao misturar chaves semanticas e indices em `__getitem__`.
-#
-# 11. Durante a construcao, toda adicao deve atualizar a colecao ordenada e o
-#     indice como uma unica operacao logica. Depois de materializada, a arvore
-#     remota pode ser congelada e usada para navegar ate o pai de cada upload.
-#
+# TODO(alpha): endurecer os contratos antes da primeira beta.
+# - validar todos os segmentos de nomes remotos segundo as regras do SharePoint;
+# - definir a politica para links, sockets e outros itens locais nao regulares;
+# - modelar o resultado parcial do upload de arvore e a arvore remota criada;
+# - decidir se a arvore de staging deve delegar os totais de `source`;
+# - decidir se `RootUploadMode` integra o staging ou deve ser removido.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from multiprocessing import Value
 from pathlib import Path, PurePosixPath
 from typing import (
     ClassVar,
@@ -155,18 +62,11 @@ from core.errors import (
     LocalPathNotFoundError,
 )
 
-# `T` representa o tipo de item armazenado por uma colecao generica.
 T = TypeVar("T")
 
-# Politica de conflito aceita pelas operacoes de criacao e upload.
 ConflictBehavior = Literal["fail", "rename", "replace"]
 
 RootUploadMode = Literal["include_root", "contents_only"]
-
-# `CollectionItem` permanece como classe base semantica para identificar os
-# modelos que podem viver dentro das colecoes do Core.
-
-# BaseClasses
 
 
 @dataclass(frozen=True)
@@ -187,7 +87,6 @@ class GraphCredentials:
     tenant_id: str
 
 
-# Representa um item genérico de coleção
 class CollectionItem(ABC):
     """Marcador semantico para itens que circulam nas colecoes do Core.
 
@@ -198,7 +97,6 @@ class CollectionItem(ABC):
     """
 
 
-# Remote DocumentLibraries  Models
 @dataclass(frozen=True)
 class SharePointSite(CollectionItem):
     """
@@ -497,11 +395,10 @@ class RootFolder:
 
     def __post_init__(self):
         """Valida a existencia da raiz e a correspondencia de seu nome."""
-        assert self.path.exists(), (
-            f"O caminho passado não é válido self.path.exists(): {self.path.exists()}"
-        )
+        assert self.path.exists(), f"O diretorio raiz local nao existe: '{self.path}'."
         assert self.name == self.path.name, (
-            f"self.name deve corresponder ao nome real do Folder"
+            f"O nome da raiz deve ser '{self.path.name}', mas foi recebido "
+            f"'{self.name}'."
         )
 
     @classmethod
@@ -533,11 +430,10 @@ class LocalFolder(CollectionItem):
 
     def __post_init__(self):
         """Valida a existencia da pasta e a correspondencia de seu nome."""
-        assert self.path.exists(), (
-            f"O caminho passado não é válido self.path.exists(): {self.path.exists()}"
-        )
+        assert self.path.exists(), f"O diretorio local nao existe: '{self.path}'."
         assert self.name == self.path.name, (
-            f"self.name deve corresponder ao nome real do Folder"
+            f"O nome da pasta deve ser '{self.path.name}', mas foi recebido "
+            f"'{self.name}'."
         )
 
     @classmethod
@@ -570,19 +466,23 @@ class LocalFile(CollectionItem):
 
     def __post_init__(self):
         """Valida metadados e aplica a politica para arquivos vazios."""
-        assert self.path.exists(), (
-            f"O caminho passado não é válido self.path.exists(): {self.path.exists()}"
-        )
+        assert self.path.exists(), f"O arquivo local nao existe: '{self.path}'."
         assert self.name == self.path.name, (
-            "self.name deve corresponder ao nome real do arquivo"
+            f"O nome do arquivo deve ser '{self.path.name}', mas foi recebido "
+            f"'{self.name}'."
         )
         assert self.extension == self.path.suffix, (
-            "self.extension deve corresponder a extensão real"
+            f"A extensao do arquivo deve ser '{self.path.suffix}', mas foi "
+            f"recebido '{self.extension}'."
         )
         if self.allow_empty == "deny":
-            assert self.size > 0, "self.size deve ter conteúdo"
+            assert self.size > 0, (
+                f"O arquivo '{self.path}' deve possuir ao menos um byte."
+            )
         if self.allow_empty == "allow":
-            assert self.size >= 0
+            assert self.size >= 0, (
+                f"O tamanho do arquivo nao pode ser negativo: {self.size}."
+            )
 
     @classmethod
     def from_uri(cls, path: str | Path) -> Self:
@@ -912,7 +812,6 @@ class StagingFilesystemTree:
     source: FilesystemTree
     levels: StagingDirectoryLevelCollection
     conflict_behavior: ConflictBehavior = "fail"
-    # `"."` copia os filhos diretamente para a raiz remota recebida.
     target_root: PurePosixPath = PurePosixPath(".")
 
     def __post_init__(self):
@@ -920,10 +819,10 @@ class StagingFilesystemTree:
         if self.target_root.is_absolute():
             raise InvalidRemoteNameError(
                 "target_root deve ser um fragmento remoto relativo ao pai, "
-                f"mas foi recebido um caminho absoluto: {self.target_root}."
+                f"mas foi recebido um caminho absoluto: '{self.target_root}'."
             )
         if ".." in self.target_root.parts:
             raise InvalidRemoteNameError(
                 "target_root nao pode sair do pai remoto usando '..': "
-                f"{self.target_root}."
+                f"'{self.target_root}'."
             )

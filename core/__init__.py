@@ -8,12 +8,8 @@ Regra pratica:
     apenas ao trabalhar dentro da propria implementacao do Core.
 """
 
-# Modelos e colecoes formam o contrato de dados mais basico do Core.
-# Builders montam bodies do SDK sem expor essa montagem ao servico.
 from core.builders import build_folder_drive_item as build_folder_drive_item
 
-# Erros publicos do Core, reexportados para que outras camadas nao precisem
-# conhecer a estrutura interna de modulos.
 from core.errors import (
     DefaultDriveNotFoundError,
     DriveItemNotFoundError,
@@ -42,6 +38,9 @@ from core.errors import (
     SharePointUrlError,
     SiteResolutionError,
     SmallFileUploadError,
+    TreeDirectoryCreationError,
+    TreeFileUploadError,
+    TreeUploadError,
     UploadChunkError,
     UploadError,
     UploadSessionCreationError,
@@ -49,8 +48,6 @@ from core.errors import (
 from core.filesystem import LocalFileSystemScanner
 from core.filesystem_staging import StagingTreeBuilder
 
-# Integracao com o Microsoft Graph: criacao do client e ciclo de vida da
-# credencial assincrona.
 from core.graph_client import (
     GraphClientManager,
     create_graph_client,
@@ -92,11 +89,8 @@ from core.parse import (
     parse_site_collection_response,
 )
 
-# O servico concentra as regras de navegacao, criacao e upload sobre o client.
 from core.sharepoint import SharePointService
 
-# Helpers de URL usados para validar entradas e montar rotas especiais do
-# Graph.
 from core.urls import (
     build_create_content_url,
     build_drive_create_content_url,
