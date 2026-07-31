@@ -185,7 +185,9 @@ Colecoes concretas:
 - `LocalFileCollection`;
 - `LocalFolderCollection`;
 - `DirectoryLevelCollection`;
-- `PreparedUploadCollection`.
+- `StagingFileCollection`;
+- `StagingFolderCollection`;
+- `StagingDirectoryLevelCollection`.
 
 ## 7. Scanner Local
 
@@ -364,10 +366,10 @@ Fluxo atual:
 `core/parse.py` converte modelos e envelopes do SDK para modelos do Core e
 traduz `ODataError`.
 
-`core/builders.py` valida nomes e politicas de conflito e monta:
-
-- o `DriveItem` usado na criacao de pasta;
-- o `PreparedUpload` usado pelo upload pequeno.
+`core/builders.py` valida nomes e politicas de conflito e monta o `DriveItem`
+usado na criacao de pasta. O upload pequeno trabalha diretamente com
+`LocalFile`; seus fragmentos de rota sao construidos apenas no momento do
+envio.
 
 `core/urls.py` valida URLs do Graph e constroi:
 
@@ -449,6 +451,21 @@ Obrigacoes:
 - registrar sucesso, falha e destino por item;
 - definir comportamento de retomada e falha parcial;
 - respeitar throttling e erros transitorios do Graph.
+
+Ordem de entrega:
+
+1. A primeira versao sera sequencial e permanecera em `SharePointService`.
+2. A primeira passagem criara ou resolvera os diretorios em ordem top-down.
+3. A segunda passagem enviara os arquivos com o `upload()` individual.
+4. A representacao semantica da arvore remota sera uma evolucao posterior a
+   esse fluxo funcional.
+
+Na evolucao posterior, `RemoteDirectoryTree` devera encapsular uma colecao
+ordenada de niveis remotos e um indice interno
+`dict[PurePosixPath, int]`. A interface podera usar `__getitem__`,
+`__contains__`, `__iter__` e `__len__` para oferecer navegacao semelhante a um
+mapping sem expor o dicionario. A busca pelo pai remoto deve usar o indice em
+vez de percorrer linearmente toda a colecao para cada arquivo.
 
 ## 14. Criterios Para Beta
 

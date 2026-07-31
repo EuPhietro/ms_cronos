@@ -33,7 +33,6 @@ Exemplo basico:
     assert sites.first() == site
 """
 
-
 # TODO(staging-tree): concluir os models da arvore preparada.
 #
 # Fluxo:
@@ -91,9 +90,9 @@ Exemplo basico:
 # 5. Implementar as propriedades derivadas `total_files`, `total_folders`,
 #    `total_levels` e `total_size`, sem armazenar contadores duplicados.
 #
-# 6. Implementar `StagingService` como transformador deterministico:
+# 6. Implementar `StagingTreeBuilder` como transformador deterministico:
 #
-#    StagingService.build_tree(
+#    StagingTreeBuilder.build_tree(
 #        tree: FilesystemTree,
 #        target_root: PurePosixPath = PurePosixPath("."),
 #        conflict_behavior: ConflictBehavior = "fail",
@@ -102,6 +101,35 @@ Exemplo basico:
 #    O transformador deve preservar a ordem top-down, diretorios vazios e toda
 #    a estrutura relativa, sem abrir arquivos, carregar bytes, acessar a rede
 #    ou alterar o filesystem local.
+#
+# 7. Primeira entrega: implementar em `SharePointService` uma versao inicial e
+#    sequencial do upload da arvore. O fluxo deve criar ou resolver todos os
+#    diretorios em ordem top-down e, em uma segunda passagem, enviar os
+#    arquivos usando o `upload()` individual ja existente.
+#
+# Evolucao posterior a primeira versao funcional:
+#
+# 8. Modelar a arvore de diretorios materializada no SharePoint com contratos
+#    semanticos como `RemoteDirectoryLevel` e `RemoteDirectoryTree`.
+#
+# 9. A arvore remota deve preservar a ordem top-down em uma colecao interna e
+#    manter um indice auxiliar `dict[PurePosixPath, int]`. O indice aponta para
+#    a posicao do nivel na colecao, permitindo resolver o pai remoto de cada
+#    arquivo sem percorrer toda a arvore.
+#
+# 10. Expor navegacao semelhante a um mapping por dunder methods:
+#
+#        __getitem__(relative_path) -> RemoteDirectoryLevel
+#        __contains__(relative_path) -> bool
+#        __iter__() -> Iterator[RemoteDirectoryLevel]
+#        __len__() -> int
+#
+#     O acesso posicional deve permanecer explicito, por exemplo `at(index)`,
+#     para nao misturar chaves semanticas e indices em `__getitem__`.
+#
+# 11. Durante a construcao, toda adicao deve atualizar a colecao ordenada e o
+#     indice como uma unica operacao logica. Depois de materializada, a arvore
+#     remota pode ser congelada e usada para navegar ate o pai de cada upload.
 #
 from __future__ import annotations
 
@@ -133,7 +161,7 @@ T = TypeVar("T")
 # Politica de conflito aceita pelas operacoes de criacao e upload.
 ConflictBehavior = Literal["fail", "rename", "replace"]
 
-RootUploadMode = Literal['include_root','contents_only']
+RootUploadMode = Literal["include_root", "contents_only"]
 
 # `CollectionItem` permanece como classe base semantica para identificar os
 # modelos que podem viver dentro das colecoes do Core.
@@ -724,7 +752,7 @@ class StagingFile(CollectionItem):
     """
 
     source: LocalFile  # Arquivo local que sera enviado.
-    relative_path: Path  # Caminho relativo a raiz do `FilesystemTree`.
+    relative_path: PurePosixPath  # Caminho relativo a raiz do `FilesystemTree`.
     remote_name: str  # Nome final planejado para o recurso remoto.
     conflict_behavior: ConflictBehavior = "fail"
 
@@ -775,7 +803,7 @@ class StagingFolder(CollectionItem):
     """
 
     source: LocalFolder
-    relative_path: Path
+    relative_path: PurePosixPath
     remote_name: str
 
     def __post_init__(self):
@@ -829,7 +857,7 @@ class StagingDirectoryLevel(CollectionItem):
     """
 
     source: DirectoryLevel
-    relative_path: Path
+    relative_path: PurePosixPath
     staging_files: StagingFileCollection
     staging_folders: StagingFolderCollection
 
@@ -855,6 +883,7 @@ class StagingDirectoryLevel(CollectionItem):
                 "O relative_path do nivel nao pode sair da raiz da arvore "
                 f"usando '..': {self.relative_path}."
             )
+
 
 @dataclass(frozen=True)
 class StagingDirectoryLevelCollection(FrozenCollection[StagingDirectoryLevel]):

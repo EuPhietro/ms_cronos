@@ -61,7 +61,7 @@ __pycache__/
 ```text
 core/
 ├── __init__.py       # reexports atuais
-├── builders.py       # payload de pasta e PreparedUpload
+├── builders.py       # payload de pasta e politicas de conflito
 ├── errors.py         # erros semanticos
 ├── filesystem.py     # scanner local
 ├── graph_client.py   # credencial e GraphServiceClient
@@ -84,11 +84,14 @@ SharePointSite
 DocumentLibrary
 SharePointItem
 FileUploadResult
-PreparedUpload
 LocalFile
 LocalFolder
 DirectoryLevel
 FilesystemTree
+StagingFile
+StagingFolder
+StagingDirectoryLevel
+StagingFilesystemTree
 ```
 
 Colecoes publicas de retorno sao imutaveis e concretas:

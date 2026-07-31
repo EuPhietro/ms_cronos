@@ -1249,8 +1249,7 @@ class SharePointService:
         if not parent.is_folder:
             raise NotAFolderError(f"{parent.name} não é um Folder válido")
         if not local_file.path.exists():
-            raise LocalPathNotFoundError(
-                "O caminho para o arquivo local não existe")
+            raise LocalPathNotFoundError("O caminho para o arquivo local não existe")
 
         if not local_file.path.is_file():
             raise LocalPathIsDirectoryError(
@@ -1258,8 +1257,7 @@ class SharePointService:
             )
 
         if not local_file.size:
-            raise LocalFileNotReadableError(
-                "Não foi possível ler o arquivo passado")
+            raise LocalFileNotReadableError("Não foi possível ler o arquivo passado")
 
         if local_file.size > MAX_SMALL_FILE_SIZE:
             return await self._upload_large_file(
@@ -1464,8 +1462,7 @@ class SharePointService:
         """
         # O endpoint de sessao cria o arquivo como filho de um item pasta.
         if not parent.is_folder:
-            raise NotAFolderError(
-                f"O item {parent.id} nao e uma pasta de destino.")
+            raise NotAFolderError(f"O item {parent.id} nao e uma pasta de destino.")
 
         # As validacoes locais evitam criar uma sessao que nao podera ser
         # usada.
@@ -1494,8 +1491,7 @@ class SharePointService:
                 # ranges e enviar cada trecho do stream.
                 upload_task = LargeFileUploadTask(
                     upload_session=upload_session,
-                    request_adapter=(
-                        self._client_manager.client.request_adapter),
+                    request_adapter=(self._client_manager.client.request_adapter),
                     stream=file_stream,  # type: ignore
                     parsable_factory=DriveItem,
                     max_chunk_size=MAX_CHUNK_SIZE,
@@ -1505,8 +1501,7 @@ class SharePointService:
             # O resultado cru do SDK informa se a task considera o envio
             # concluido.
             if not upload_result.upload_succeeded:
-                raise RuntimeError(
-                    f"Upload nao concluido para {local_file.name}")
+                raise RuntimeError(f"Upload nao concluido para {local_file.name}")
         except LocalPathNotFoundError:
             raise
         except LocalPathIsDirectoryError:
@@ -1575,12 +1570,10 @@ class SharePointService:
         # As propriedades uploadable carregam metadados aplicados ao arquivo
         # remoto quando a sessao for finalizada.
         uploadable_propieties = DriveItemUploadableProperties(
-            additional_data={
-                "@microsoft.graph.conflictBehavior": conflict_behavior}
+            additional_data={"@microsoft.graph.conflictBehavior": conflict_behavior}
         )
 
-        request_body = CreateUploadSessionPostRequestBody(
-            item=uploadable_propieties)
+        request_body = CreateUploadSessionPostRequestBody(item=uploadable_propieties)
 
         # O endereco por path combina o id do pai com o nome do arquivo
         # que sera criado ou resolvido pelo Graph.
