@@ -6,15 +6,19 @@ MS Cronos e um wrapper Python assincrono para Microsoft Graph e SharePoint.
 Seu Core fornece tipos semanticos para autenticacao, navegacao remota, criacao
 de pastas, upload de arquivos e leitura de arvores locais.
 
-Estado desta especificacao:
+Versao desta especificacao: **Beta 1 (`0.1.0b1`)**.
 
 - navegacao de sites, bibliotecas e itens: implementada;
 - paginacao de bibliotecas e itens: implementada;
 - criacao e garantia de caminhos remotos: implementada;
 - upload individual pequeno e grande: implementado;
 - scanner recursivo do filesystem: implementado;
-- staging e upload de diretorios completos: planejados;
-- testes automatizados e empacotamento: pendentes.
+- staging e upload sequencial de diretorios completos: implementados;
+- cache remoto, retry e checkpoint JSON atomico: implementados;
+- progresso e cancelamento cooperativo: implementados;
+- API publica, versionamento e empacotamento: implementados;
+- testes unitarios: implementados;
+- integracao Graph somente leitura: implementada como teste opt-in.
 
 Esta especificacao descreve o codigo atual. Os modelos do SDK mencionados aqui
 sao detalhes internos, exceto quando o consumidor usa deliberadamente
@@ -46,7 +50,8 @@ Regras:
 3. `GraphClientManager.client` e uma extensao avancada e, quando usada,
    transfere ao consumidor a dependencia direta do SDK.
 4. `LocalFileSystemScanner` nao conhece SharePoint nem executa upload.
-5. O futuro staging associa o snapshot local a destinos remotos.
+5. `StagingTreeBuilder` associa o snapshot local a fragmentos remotos sem
+   realizar chamadas de rede.
 
 ## 4. Hierarquia Remota
 
@@ -356,10 +361,48 @@ upload(
 
 Fluxo atual:
 
-- ate `250_000_000` bytes: le o arquivo em memoria e usa `PUT /content`;
+- ate `10 * 1024 * 1024` bytes: le o arquivo em memoria e usa `PUT /content`;
 - acima desse limite: cria uma upload session e usa `LargeFileUploadTask`;
-- chunks grandes usam limite de `60 * 1024 * 1024` bytes;
+- chunks usam `10 * 1024 * 1024` bytes, multiplo de 320 KiB e abaixo do limite
+  de 60 MiB por requisicao do Graph;
 - o retorno publico de ambos os fluxos e `FileUploadResult`.
+
+### 9.6 Upload de arvore
+
+```python
+upload_tree(
+    parent: SharePointItem,
+    library: DocumentLibrary,
+    staging_tree: StagingFilesystemTree,
+    conflict_behavior: ConflictBehavior = "fail",
+    *,
+    checkpoint: TreeUploadResult | None = None,
+    checkpoint_path: str | Path | None = None,
+    checkpoint_interval: int = 100,
+    progress_callback: TreeUploadProgressCallback | None = None,
+    cancel_event: asyncio.Event | None = None,
+) -> TreeUploadResult
+```
+
+O executor resolve o `target_root` uma vez, cria os diretorios em ordem
+top-down e lista os filhos imediatos uma vez por nivel. O indice resultante e
+reutilizado para detectar conflitos de arquivos sem uma consulta por arquivo.
+Niveis completos e arquivos confirmados sao registrados em
+`TreeUploadResult`. Erros de arvore carregam o progresso em `partial_result`.
+
+O checkpoint JSON usa substituicao atomica e nao armazena credenciais, bytes ou
+URLs de upload session. Ele registra a origem local, a biblioteca, o pai remoto
+e o `target_root`; uma divergencia levanta `CheckpointMismatchError` antes de
+qualquer chamada remota. A persistencia acontece ao fim de cada fase e segundo
+`checkpoint_interval` durante operacoes extensas.
+
+Uma impressao digital estrutural inclui caminhos relativos, nomes remotos,
+tamanhos e politicas de conflito. Ela nao calcula hash do conteudo; uma edicao
+que preserve caminho e tamanho nao e detectada nesta versao.
+
+O callback recebe snapshots `TreeUploadProgress` e pode ser sincronono ou
+assincrono. `cancel_event` e consultado entre operacoes remotas; o cancelamento
+levanta `TreeUploadCancelledError` com `partial_result` e preserva o checkpoint.
 
 ## 10. Parsers, Builders e URLs
 
@@ -377,8 +420,7 @@ envio.
 - o fragmento de criacao por nome;
 - a URL absoluta de criacao de conteudo no drive.
 
-Esses helpers sao reexportados atualmente por `core`, mas ainda devem ser
-tratados como infraestrutura interna ate a consolidacao da API publica.
+Esses helpers permanecem internos e nao fazem parte de `core.__all__`.
 
 ## 11. Erros
 
@@ -401,23 +443,20 @@ devem ser relancadas sem perder o traceback original.
 Estas pendencias foram observadas no codigo atual e nao devem ser confundidas
 com funcionalidades implementadas:
 
-1. `parse_local_file()` usa `path.suffix or None`, mas `LocalFile.extension`
-   exige `str`; arquivos sem extensao quebram esse contrato.
-2. `find_file_by_name()` ainda nao anota `library` e `parent`.
-3. `LocalFile.rename_on_disk()` move fisicamente o arquivo, apesar de o nome
+1. `LocalFile.rename_on_disk()` move fisicamente o arquivo, apesar de o nome
    sugerir que o model poderia apenas representar outro nome remoto.
-4. `upload()` rejeita zero bytes mesmo quando `LocalFile.allow_empty` e
+2. `upload()` rejeita zero bytes mesmo quando `LocalFile.allow_empty` e
    `"allow"`; a politica de arquivos vazios ainda nao esta sincronizada com o
    uploader.
-5. parsers, builders e helpers internos ainda sao reexportados em
-   `core/__init__.py`.
-6. nao existe suite automatizada de testes.
-7. a lista completa de dependencias esta congelada em `requirements.txt`, sem
-   metadados de pacote ou separacao entre dependencias diretas e transitivas.
+3. a retomada persistente ocorre por arquivo confirmado, nao dentro de um
+   upload session interrompido.
+4. o teste de integracao somente leitura exige configuracao explicita e nao e
+   executado pela suite padrao.
+5. o nome de importacao historico permanece `core`, embora seja generico.
 
-## 13. Proxima Fase: Staging de Diretorios
+## 13. Upload De Diretorios
 
-Modelos planejados:
+Modelos implementados:
 
 ```text
 StagingFile
@@ -429,7 +468,7 @@ StagingDirectoryLevelCollection
 StagingFilesystemTree
 ```
 
-Contrato esperado:
+Contrato atual:
 
 ```text
 LocalFileSystemScanner
@@ -448,17 +487,17 @@ Obrigacoes:
 - preservar diretorios vazios;
 - selecionar upload pequeno ou grande para cada arquivo;
 - nao carregar a arvore inteira em bytes;
-- registrar sucesso, falha e destino por item;
-- definir comportamento de retomada e falha parcial;
-- respeitar throttling e erros transitorios do Graph.
+- registrar sucesso e destino por item confirmado;
+- expor resultado parcial e checkpoint para retomada entre processos;
+- respeitar `Retry-After` e aplicar backoff em erros transitorios do Graph.
 
-Ordem de entrega:
+Fluxo implementado:
 
 1. A primeira versao sera sequencial e permanecera em `SharePointService`.
 2. A primeira passagem criara ou resolvera os diretorios em ordem top-down.
 3. A segunda passagem enviara os arquivos com o `upload()` individual.
-4. A representacao semantica da arvore remota sera uma evolucao posterior a
-   esse fluxo funcional.
+4. `TreeUploadResult` registra diretorios remotos, arquivos enviados e niveis
+   concluidos.
 
 Na evolucao posterior, `RemoteDirectoryTree` devera encapsular uma colecao
 ordenada de niveis remotos e um indice interno
@@ -467,9 +506,9 @@ ordenada de niveis remotos e um indice interno
 mapping sem expor o dicionario. A busca pelo pai remoto deve usar o indice em
 vez de percorrer linearmente toda a colecao para cada arquivo.
 
-## 14. Criterios Para Beta
+## 14. Criterios Da Beta 1
 
-Uma beta utilizavel deve incluir:
+Entregue nesta versao:
 
 - inconsistencias de assinatura corrigidas;
 - staging local-remoto implementado;
@@ -477,6 +516,6 @@ Uma beta utilizavel deve incluir:
 - resultado agregado e falha parcial documentados;
 - testes unitarios dos models, scanner, parsers e staging;
 - testes de paginacao e conflito;
-- ao menos um teste de integracao controlado;
+- teste de integracao somente leitura e opt-in;
 - API publica delimitada com `__all__`;
-- metadados basicos de pacote e licenca definidos.
+- metadados de pacote e distribuicao publica sob a licenca MIT definidos.

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ms-cronos"
+version = "0.1.0b1"
+description = "Wrapper assincrono e semantico para SharePoint via Microsoft Graph"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+dependencies = [
+    "azure-identity>=1.25,<2",
+    "httpx>=0.28,<1",
+    "msgraph-core>=1.4,<2",
+    "msgraph-sdk>=1.58,<2",
+]
+
+[project.urls]
+Homepage = "https://github.com/EuPhietro/ms_cronos"
+Repository = "https://github.com/EuPhietro/ms_cronos.git"
+Issues = "https://github.com/EuPhietro/ms_cronos/issues"
+
+[project.optional-dependencies]
+dev = [
+    "python-dotenv>=1.2,<2",
+    "pyright>=1.1.411,<2",
+    "rich>=15,<16",
+    "ruff>=0.16,<1",
+]
+
+[tool.setuptools.packages.find]
+include = ["core*"]
+
+[tool.setuptools.package-data]
+core = ["py.typed"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]

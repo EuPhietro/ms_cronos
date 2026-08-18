@@ -13,6 +13,13 @@ __pycache__/
 
 # Ignorando variáveis de ambiente
 .env
+*.ms-cronos-upload.json
+.ms-cronos-upload.json
+
+# Artefatos de distribuicao
+build/
+dist/
+*.egg-info/
 
 
 # Ignorando .vscode

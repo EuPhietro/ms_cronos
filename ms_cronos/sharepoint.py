@@ -19,9 +19,15 @@ Exemplo de consumo pagina a pagina:
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Sequence
-from pathlib import PurePosixPath
+import asyncio
+import hashlib
+import inspect
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import TypeVar
 
+import httpx
 from msgraph.generated.drives.item.items.item.create_upload_session.create_upload_session_post_request_body import (
     CreateUploadSessionPostRequestBody,
 )
@@ -40,7 +46,9 @@ from msgraph_core import PageIterator
 from msgraph_core.tasks import LargeFileUploadTask
 
 from core.builders import build_folder_drive_item, normalize_conflict_behavior
+from core.checkpoint import TreeUploadCheckpointStore
 from core.errors import (
+    CheckpointMismatchError,
     DefaultDriveNotFoundError,
     DriveItemNotFoundError,
     DriveNotFoundError,
@@ -48,18 +56,19 @@ from core.errors import (
     FileAlreadyExistError,
     FileVeryLargeError,
     GraphResponseError,
+    GraphTransportError,
     InvalidConflictBehaviorError,
     InvalidRemoteNameError,
     LocalFileNotReadableError,
     LocalPathIsDirectoryError,
     LocalPathNotFoundError,
-    MSCronosError,
     NotAFileError,
     NotAFolderError,
     SiteResolutionError,
     SmallFileUploadError,
     TreeDirectoryCreationError,
     TreeFileUploadError,
+    TreeUploadCancelledError,
     TreeUploadError,
     UploadError,
 )
@@ -74,6 +83,9 @@ from core.models import (
     SharePointItemCollection,
     SharePointSite,
     StagingFilesystemTree,
+    TreeUploadProgress,
+    TreeUploadProgressCallback,
+    TreeUploadResult,
 )
 from core.parse import (
     adapt_site,
@@ -87,13 +99,27 @@ from core.urls import (
     build_create_content_url,
     build_drive_create_content_url,
     build_graph_site_url,
+    validate_remote_path,
 )
 from core.utils import rename_with_uuid
 
-# Tamanho maximo entregue ao `LargeFileUploadTask` em cada envio parcial.
-MAX_CHUNK_SIZE = 60 * 1024 * 1024
+MAX_CHUNK_SIZE = 10 * 1024 * 1024
+MAX_SMALL_FILE_SIZE = 10 * 1024 * 1024
+MAX_GRAPH_ATTEMPTS = 4
+MAX_RETRY_DELAY_SECONDS = 30.0
+RETRYABLE_GRAPH_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504, 509})
 
-MAX_SMALL_FILE_SIZE = 250_000_000  # 250 milhões de bytes
+_GraphResultT = TypeVar("_GraphResultT")
+
+
+@dataclass
+class _RemoteTreeState:
+    """Estado interno da arvore remota durante uma execucao."""
+
+    result: TreeUploadResult
+    children_by_level: dict[PurePosixPath, dict[str, SharePointItem]] = field(
+        default_factory=dict
+    )
 
 
 class SharePointService:
@@ -148,6 +174,134 @@ class SharePointService:
         """
         self._client_manager = graph_client_manager
 
+    async def _execute_graph_operation(
+        self,
+        operation: Callable[[], Awaitable[_GraphResultT]],
+        *,
+        operation_name: str,
+        retry_transport: bool = True,
+    ) -> _GraphResultT:
+        """Executa uma chamada Graph com retry para falhas transitórias."""
+        for attempt in range(1, MAX_GRAPH_ATTEMPTS + 1):
+            try:
+                return await operation()
+            except ODataError as error:
+                if (
+                    error.response_status_code not in RETRYABLE_GRAPH_STATUS_CODES
+                    or attempt == MAX_GRAPH_ATTEMPTS
+                ):
+                    raise
+                delay = self._retry_delay(error.response_headers, attempt)
+            except httpx.TransportError as error:
+                if not retry_transport or attempt == MAX_GRAPH_ATTEMPTS:
+                    raise GraphTransportError(
+                        f"Falha de transporte durante '{operation_name}' apos "
+                        f"{attempt} tentativa(s): {error}."
+                    ) from error
+                delay = self._retry_delay(None, attempt)
+
+            await asyncio.sleep(delay)
+
+        raise GraphTransportError(
+            f"A operacao '{operation_name}' excedeu o limite de tentativas."
+        )
+
+    @staticmethod
+    def _retry_delay(
+        headers: dict[str, str] | None,
+        attempt: int,
+    ) -> float:
+        """Prioriza `Retry-After` e usa backoff exponencial como fallback."""
+        if headers:
+            retry_after = next(
+                (
+                    value
+                    for key, value in headers.items()
+                    if key.casefold() == "retry-after"
+                ),
+                None,
+            )
+            if retry_after is not None:
+                try:
+                    return min(float(retry_after), MAX_RETRY_DELAY_SECONDS)
+                except ValueError:
+                    pass
+        return min(float(2 ** (attempt - 1)), MAX_RETRY_DELAY_SECONDS)
+
+    @staticmethod
+    def _bind_tree_result(
+        result: TreeUploadResult,
+        *,
+        parent: SharePointItem,
+        library: DocumentLibrary,
+        staging_tree: StagingFilesystemTree,
+    ) -> None:
+        """Vincula um checkpoint a uma unica origem e destino remoto."""
+        expected = {
+            "source_root": staging_tree.source.root.path.resolve(),
+            "library_id": library.id,
+            "parent_item_id": parent.id,
+            "target_root": staging_tree.target_root,
+            "staging_fingerprint": SharePointService._staging_fingerprint(staging_tree),
+        }
+
+        for attribute, expected_value in expected.items():
+            current_value = getattr(result, attribute)
+            if current_value is not None and current_value != expected_value:
+                raise CheckpointMismatchError(
+                    "O checkpoint nao pertence a esta operacao de upload: "
+                    f"'{attribute}' esperava {expected_value!r}, mas contem "
+                    f"{current_value!r}."
+                )
+            setattr(result, attribute, expected_value)
+
+    @staticmethod
+    def _staging_fingerprint(staging_tree: StagingFilesystemTree) -> str:
+        """Resume estrutura, nomes, tamanhos e conflitos sem ler os arquivos."""
+        entries: list[str] = []
+        for level in staging_tree.levels:
+            entries.append(f"level:{level.relative_path.as_posix()}")
+            entries.extend(
+                f"folder:{folder.relative_path.as_posix()}:{folder.remote_name}"
+                for folder in level.staging_folders
+            )
+            entries.extend(
+                "file:"
+                f"{file.relative_path.as_posix()}:{file.remote_name}:"
+                f"{file.source.size}:{file.conflict_behavior}"
+                for file in level.staging_files
+            )
+
+        digest = hashlib.sha256()
+        for entry in sorted(entries):
+            digest.update(entry.encode("utf-8"))
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _raise_if_tree_cancelled(
+        cancel_event: asyncio.Event | None,
+        result: TreeUploadResult,
+    ) -> None:
+        """Interrompe o fluxo em um ponto seguro preservando o progresso."""
+        if cancel_event is not None and cancel_event.is_set():
+            raise TreeUploadCancelledError(
+                "O upload da arvore foi cancelado pelo chamador.",
+                partial_result=result,
+            )
+
+    @staticmethod
+    async def _notify_tree_progress(
+        callback: TreeUploadProgressCallback | None,
+        progress: TreeUploadProgress,
+    ) -> None:
+        """Aceita callbacks sincrononos ou assincronos de progresso."""
+        if callback is None:
+            return
+        callback_result = callback(progress)
+        if inspect.isawaitable(callback_result):
+            await callback_result
+
     # Resolucao de sites
 
     async def resolve_site(
@@ -174,9 +328,10 @@ class SharePointService:
         try:
             secure_url = build_graph_site_url(sharepoint_url)
 
-            response = await self._client_manager.client.sites.with_url(
-                secure_url
-            ).get()
+            response = await self._execute_graph_operation(
+                lambda: self._client_manager.client.sites.with_url(secure_url).get(),
+                operation_name=f"resolver site '{sharepoint_url}'",
+            )
 
             if not response:
                 raise SiteResolutionError(
@@ -242,9 +397,12 @@ class SharePointService:
         ) -> DriveCollectionResponse:
             """Solicita e valida o envelope inicial devolvido pelo Graph."""
             try:
-                response = await self._client_manager.client.sites.by_site_id(
-                    site.id
-                ).drives.get()
+                response = await self._execute_graph_operation(
+                    lambda: self._client_manager.client.sites.by_site_id(
+                        site.id
+                    ).drives.get(),
+                    operation_name=f"listar bibliotecas do site '{site.id}'",
+                )
 
                 if not response:
                     raise DriveNotFoundError(
@@ -304,12 +462,13 @@ class SharePointService:
             if max_pages is not None and page_counter >= max_pages:
                 break
 
-            current_page = await page_iterator.next()
+            current_page = await self._execute_graph_operation(
+                page_iterator.next,
+                operation_name=f"obter proxima pagina de bibliotecas de '{site.id}'",
+            )
 
             if not current_page:
                 break
-
-            page_iterator.current_page = current_page
 
         return DocumentLibraryCollection.from_collection(pages)
 
@@ -375,9 +534,12 @@ class SharePointService:
             MSCronosError: Se uma falha OData for traduzida pelo Core.
         """
         try:
-            response = await self._client_manager.client.sites.by_site_id(
-                site.id
-            ).drive.get()
+            response = await self._execute_graph_operation(
+                lambda: self._client_manager.client.sites.by_site_id(
+                    site.id
+                ).drive.get(),
+                operation_name=f"obter biblioteca padrao do site '{site.id}'",
+            )
 
             if not response:
                 raise DefaultDriveNotFoundError(
@@ -410,9 +572,10 @@ class SharePointService:
             MSCronosError: Se uma falha OData for traduzida pelo Core.
         """
         try:
-            response = await self._client_manager.client.drives.by_drive_id(
-                drive_id
-            ).get()
+            response = await self._execute_graph_operation(
+                lambda: self._client_manager.client.drives.by_drive_id(drive_id).get(),
+                operation_name=f"obter biblioteca '{drive_id}'",
+            )
 
             if not response:
                 raise DriveNotFoundError(
@@ -445,9 +608,12 @@ class SharePointService:
             MSCronosError: Se uma falha OData for traduzida pelo Core.
         """
         try:
-            site_response = await self._client_manager.client.drives.by_drive_id(
-                library.id
-            ).root.get()
+            site_response = await self._execute_graph_operation(
+                lambda: self._client_manager.client.drives.by_drive_id(
+                    library.id
+                ).root.get(),
+                operation_name=f"obter raiz da biblioteca '{library.id}'",
+            )
 
             if not site_response:
                 raise DriveNotFoundError(
@@ -498,10 +664,16 @@ class SharePointService:
             """Solicita o envelope inicial usado para criar o paginador."""
 
             try:
-                response = (
-                    await self._client_manager.client.drives.by_drive_id(library.id)
-                    .items.by_drive_item_id(parent.id)
-                    .children.get()
+                response = await self._execute_graph_operation(
+                    lambda: (
+                        self._client_manager.client.drives.by_drive_id(library.id)
+                        .items.by_drive_item_id(parent.id)
+                        .children.get()
+                    ),
+                    operation_name=(
+                        f"listar filhos do item '{parent.id}' na biblioteca "
+                        f"'{library.id}'"
+                    ),
                 )
 
                 if not response:
@@ -536,19 +708,22 @@ class SharePointService:
             if current_page.value is None:
                 break
 
-            if len(current_page.value) == 0:
-                return
+            if current_page.value:
+                for item in current_page.value:
+                    if not isinstance(item, DriveItem):
+                        raise TypeError(
+                            "A pagina de filhos retornou um item de tipo inesperado: "
+                            f"'{type(item).__name__}'."
+                        )
+                    page_content.append(parse_drive_item(item))
+                yield SharePointItemCollection.from_collection(page_content)
 
-            for item in current_page.value:
-                if not isinstance(item, DriveItem):
-                    raise TypeError(
-                        "A pagina de filhos retornou um item de tipo inesperado: "
-                        f"'{type(item).__name__}'."
-                    )
-                page_content.append(parse_drive_item(item))
-            yield SharePointItemCollection.from_collection(page_content)
-
-            current_page = await page_iterator.next()
+            current_page = await self._execute_graph_operation(
+                page_iterator.next,
+                operation_name=(
+                    f"obter proxima pagina de filhos do item '{parent.id}'"
+                ),
+            )
 
     async def list_children(
         self,
@@ -802,7 +977,10 @@ class SharePointService:
             ) from error
 
     async def find_file_by_name(
-        self, library, parent, name: str
+        self,
+        library: DocumentLibrary,
+        parent: SharePointItem,
+        name: str,
     ) -> SharePointItem | None:
         """Localiza o primeiro arquivo filho com o nome informado.
 
@@ -956,10 +1134,16 @@ class SharePointService:
 
             body = build_folder_drive_item(folder_name, conflict_behavior)
 
-            response = (
-                await self._client_manager.client.drives.by_drive_id(library.id)
-                .items.by_drive_item_id(parent.id)
-                .children.post(body)
+            response = await self._execute_graph_operation(
+                lambda: (
+                    self._client_manager.client.drives.by_drive_id(library.id)
+                    .items.by_drive_item_id(parent.id)
+                    .children.post(body)
+                ),
+                operation_name=(
+                    f"criar pasta '{folder_name}' sob o item '{parent.id}'"
+                ),
+                retry_transport=False,
             )
 
             if not response:
@@ -1118,6 +1302,10 @@ class SharePointService:
         parent: SharePointItem,
         local_file: LocalFile,
         conflict_behavior: ConflictBehavior = "fail",
+        *,
+        existing_file: SharePointItem | None = None,
+        remote_state_known: bool = False,
+        remote_name: str | None = None,
     ) -> FileUploadResult:
         """Envia um arquivo pequeno por PUT direto no endpoint `/content`.
 
@@ -1165,6 +1353,8 @@ class SharePointService:
             )
 
         conflict_behavior = normalize_conflict_behavior(conflict_behavior)
+        requested_remote_name = remote_name or local_file.name
+        build_create_content_url(requested_remote_name)
 
         try:
             content_bytes = local_file.path.read_bytes()
@@ -1174,49 +1364,61 @@ class SharePointService:
             ) from error
 
         try:
-            existing_file = await self.find_file_by_name(
-                library,
-                parent,
-                local_file.name,
-            )
+            if not remote_state_known:
+                existing_file = await self.find_file_by_name(
+                    library,
+                    parent,
+                    requested_remote_name,
+                )
 
-            remote_name = local_file.name
+            uploaded_remote_name = requested_remote_name
             should_create = existing_file is None
 
             if existing_file is not None and conflict_behavior == "fail":
                 raise FileAlreadyExistError(
-                    f"Ja existe um arquivo chamado '{local_file.name}' sob o "
+                    f"Ja existe um arquivo chamado '{requested_remote_name}' sob o "
                     f"item remoto '{parent.id}', e a politica de conflito e 'fail'."
                 )
             if existing_file is not None and conflict_behavior == "rename":
-                remote_name = rename_with_uuid(local_file.name)
+                uploaded_remote_name = rename_with_uuid(requested_remote_name)
                 should_create = True
 
             if should_create:
-                content_fragment = build_create_content_url(remote_name)
+                content_fragment = build_create_content_url(uploaded_remote_name)
                 create_url = build_drive_create_content_url(
                     library.id,
                     parent.id,
                     content_fragment,
                 )
-                response = await (
-                    self._client_manager.client.drives.by_drive_id(library.id)
-                    .items.by_drive_item_id(parent.id)
-                    .content.with_url(create_url)
-                    .put(content_bytes)
+                response = await self._execute_graph_operation(
+                    lambda: (
+                        self._client_manager.client.drives.by_drive_id(library.id)
+                        .items.by_drive_item_id(parent.id)
+                        .content.with_url(create_url)
+                        .put(content_bytes)
+                    ),
+                    operation_name=(
+                        f"enviar arquivo pequeno '{uploaded_remote_name}' para "
+                        f"'{parent.id}'"
+                    ),
                 )
             else:
                 if existing_file is None:
                     raise SmallFileUploadError(
                         "Nao foi possivel substituir o arquivo porque nenhum "
-                        f"item remoto corresponde a '{local_file.name}'."
+                        f"item remoto corresponde a '{requested_remote_name}'."
                     )
-                response = await (
-                    self._client_manager.client.drives.by_drive_id(library.id)
-                    .items.by_drive_item_id(existing_file.id)
-                    .content.put(content_bytes)
+                response = await self._execute_graph_operation(
+                    lambda: (
+                        self._client_manager.client.drives.by_drive_id(library.id)
+                        .items.by_drive_item_id(existing_file.id)
+                        .content.put(content_bytes)
+                    ),
+                    operation_name=(
+                        f"substituir conteudo do item '{existing_file.id}'"
+                    ),
                 )
-                remote_name = existing_file.name or local_file.name
+                uploaded_remote_name = existing_file.name or requested_remote_name
 
             if not response:
                 raise SmallFileUploadError(
@@ -1229,7 +1431,7 @@ class SharePointService:
                 item=uploaded_item,
                 source_path=local_file.path,
                 conflict_behavior=conflict_behavior,
-                remote_name=uploaded_item.name or remote_name,
+                remote_name=uploaded_item.name or uploaded_remote_name,
             )
         except (
             NotAFolderError,
@@ -1257,6 +1459,8 @@ class SharePointService:
         parent: SharePointItem,
         local_file: LocalFile,
         conflict_behavior: ConflictBehavior = "fail",
+        *,
+        remote_name: str | None = None,
     ) -> FileUploadResult:
         """Envia um arquivo grande usando uma upload session do Graph.
 
@@ -1297,12 +1501,17 @@ class SharePointService:
                 f"'{local_file.path}'."
             )
 
+        conflict_behavior = normalize_conflict_behavior(conflict_behavior)
+        requested_remote_name = remote_name or local_file.name
+        build_create_content_url(requested_remote_name)
+
         try:
             upload_session = await self._create_upload_session(
                 library=library,
                 parent=parent,
                 local_file=local_file,
                 conflict_behavior=conflict_behavior,
+                remote_name=requested_remote_name,
             )
 
             with local_file.path.open("rb") as file_stream:
@@ -1326,6 +1535,12 @@ class SharePointService:
             raise
         except RuntimeError:
             raise
+        except ODataError as error:
+            raise parse_o_data_error(error, operation="upload_large_file") from error
+        except httpx.TransportError as error:
+            raise GraphTransportError(
+                f"A conexao foi interrompida durante o upload de '{local_file.path}'."
+            ) from error
         if not upload_result.item_response:
             raise UploadError(
                 "O upload em partes foi encerrado sem retornar o item remoto "
@@ -1339,7 +1554,7 @@ class SharePointService:
             source_path=local_file.path,
             remote_name=uploaded_drive_item.name
             if uploaded_drive_item.name is not None
-            else "",
+            else requested_remote_name,
             conflict_behavior=conflict_behavior,
         )
 
@@ -1349,6 +1564,8 @@ class SharePointService:
         parent: SharePointItem,
         local_file: LocalFile,
         conflict_behavior: ConflictBehavior = "fail",
+        *,
+        remote_name: str | None = None,
     ) -> UploadSession:
         """Cria a sessao remota usada pelo fluxo de upload grande.
 
@@ -1389,28 +1606,37 @@ class SharePointService:
                 f"'{local_file.path}'."
             )
 
+        requested_remote_name = remote_name or local_file.name
+        build_create_content_url(requested_remote_name)
+
         uploadable_propieties = DriveItemUploadableProperties(
             additional_data={"@microsoft.graph.conflictBehavior": conflict_behavior}
         )
 
         request_body = CreateUploadSessionPostRequestBody(item=uploadable_propieties)
 
-        upload_session = await (
-            self._client_manager.client.drives.by_drive_id(library.id)
-            .items.by_drive_item_id(f"{parent.id}:/{local_file.name}:")
-            .create_upload_session.post(request_body)
+        upload_session = await self._execute_graph_operation(
+            lambda: (
+                self._client_manager.client.drives.by_drive_id(library.id)
+                .items.by_drive_item_id(f"{parent.id}:/{requested_remote_name}:")
+                .create_upload_session.post(request_body)
+            ),
+            operation_name=(
+                f"criar sessao de upload para '{requested_remote_name}' sob "
+                f"'{parent.id}'"
+            ),
         )
 
         if upload_session is None:
             raise RuntimeError(
                 "O Microsoft Graph nao retornou uma sessao para o upload de "
-                f"'{local_file.name}' sob o item '{parent.id}'."
+                f"'{requested_remote_name}' sob o item '{parent.id}'."
             )
 
         if upload_session.upload_url is None:
             raise RuntimeError(
                 "A sessao de upload retornada pelo Microsoft Graph nao contem "
-                f"upload_url para o arquivo '{local_file.name}'."
+                f"upload_url para o arquivo '{requested_remote_name}'."
             )
 
         return upload_session
@@ -1421,66 +1647,230 @@ class SharePointService:
         library: DocumentLibrary,
         staging_tree: StagingFilesystemTree,
         conflict_behavior: ConflictBehavior = "fail",
-    ) -> dict[PurePosixPath, dict[SharePointItem, list[FileUploadResult]]]:
+        *,
+        checkpoint: TreeUploadResult | None = None,
+        checkpoint_path: str | Path | None = None,
+        checkpoint_interval: int = 100,
+        progress_callback: TreeUploadProgressCallback | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> TreeUploadResult:
         """Cria a estrutura remota e envia os arquivos nivel por nivel.
 
         A primeira fase resolve todos os diretorios da arvore de staging. A
-        segunda usa o mapa resultante para enviar sequencialmente os arquivos
-        de cada nivel. A operacao e fail-fast e nao desfaz itens ja criados ou
-        enviados quando uma etapa posterior falha.
+        segunda reaproveita o indice de filhos de cada nivel para enviar os
+        arquivos sem repetir listagens. O progresso pode permanecer somente em
+        memoria ou ser persistido periodicamente em um checkpoint JSON.
         """
-        uploaded_tree: dict[
-            PurePosixPath, dict[SharePointItem, list[FileUploadResult]]
-        ] = {}
+        if checkpoint_interval <= 0:
+            raise ValueError(
+                "checkpoint_interval deve ser maior que zero; recebido: "
+                f"{checkpoint_interval}."
+            )
+
+        checkpoint_store = (
+            TreeUploadCheckpointStore(checkpoint_path)
+            if checkpoint_path is not None
+            else None
+        )
+        if checkpoint is not None:
+            result = checkpoint
+        elif checkpoint_store is not None and checkpoint_store.exists:
+            result = checkpoint_store.load()
+        else:
+            result = TreeUploadResult()
+
+        self._bind_tree_result(
+            result,
+            parent=parent,
+            library=library,
+            staging_tree=staging_tree,
+        )
+        total_files = sum(len(level.staging_files) for level in staging_tree.levels)
+        total_levels = len(staging_tree.levels)
+
+        await self._notify_tree_progress(
+            progress_callback,
+            TreeUploadProgress(
+                phase="preparing_directories",
+                completed_files=result.total_uploaded_files,
+                total_files=total_files,
+                completed_levels=len(result.completed_levels),
+                total_levels=total_levels,
+            ),
+        )
+        try:
+            self._raise_if_tree_cancelled(cancel_event, result)
+        except TreeUploadCancelledError:
+            if checkpoint_store is not None:
+                checkpoint_store.save(result)
+            raise
 
         try:
-            remote_tree = await self._ensure_tree(
+            remote_state = await self._ensure_tree(
                 parent=parent,
                 library=library,
                 staging_tree=staging_tree,
                 conflict_behavior=conflict_behavior,
+                result=result,
+                checkpoint_store=checkpoint_store,
+                checkpoint_interval=checkpoint_interval,
+                cancel_event=cancel_event,
             )
-        except TreeDirectoryCreationError:
+        except TreeUploadCancelledError:
+            if checkpoint_store is not None:
+                checkpoint_store.save(result)
             raise
-        except MSCronosError as error:
+        except TreeDirectoryCreationError as error:
+            if error.partial_result is None:
+                error.partial_result = result
+            if checkpoint_store is not None:
+                checkpoint_store.save(result)
+            raise
+        except Exception as error:
+            if checkpoint_store is not None:
+                checkpoint_store.save(result)
             raise TreeUploadError(
                 "Nao foi possivel preparar os diretorios remotos antes do "
                 "upload da arvore local "
-                f"'{staging_tree.source.root.path}'."
+                f"'{staging_tree.source.root.path}'.",
+                partial_result=result,
             ) from error
 
+        if checkpoint_store is not None:
+            checkpoint_store.save(result)
+
+        await self._notify_tree_progress(
+            progress_callback,
+            TreeUploadProgress(
+                phase="uploading_files",
+                completed_files=result.total_uploaded_files,
+                total_files=total_files,
+                completed_levels=len(result.completed_levels),
+                total_levels=total_levels,
+            ),
+        )
+
+        changes_since_checkpoint = 0
         for level in staging_tree.levels:
-            remote_parent = remote_tree.get(level.relative_path)
+            try:
+                self._raise_if_tree_cancelled(cancel_event, result)
+            except TreeUploadCancelledError:
+                if checkpoint_store is not None:
+                    checkpoint_store.save(result)
+                raise
+
+            if level.relative_path in result.completed_levels:
+                continue
+
+            remote_parent = result.remote_directories.get(level.relative_path)
 
             if not remote_parent:
                 raise TreeDirectoryCreationError(
                     "O nivel de staging "
                     f"'{level.relative_path}' nao possui um diretorio remoto "
-                    "resolvido apos a criacao da arvore."
+                    "resolvido apos a criacao da arvore.",
+                    partial_result=result,
                 )
 
-            uploaded_files: list[FileUploadResult] = []
+            remote_children = remote_state.children_by_level[level.relative_path]
+            uploaded_files = result.uploaded_files.setdefault(
+                level.relative_path,
+                [],
+            )
+            completed_sources = {
+                upload_result.source_path for upload_result in uploaded_files
+            }
+
             for file in level.staging_files:
                 try:
-                    uploaded_file = await self.upload(
-                        library=library,
-                        parent=remote_parent,
-                        local_file=file.source,
-                        conflict_behavior=file.conflict_behavior,
-                    )
-                except MSCronosError as error:
+                    self._raise_if_tree_cancelled(cancel_event, result)
+                except TreeUploadCancelledError:
+                    if checkpoint_store is not None:
+                        checkpoint_store.save(result)
+                    raise
+
+                if file.source.path in completed_sources:
+                    continue
+
+                target_path = staging_tree.target_root / file.relative_path
+                validate_remote_path(target_path)
+                existing_file = remote_children.get(file.remote_name.casefold())
+
+                try:
+                    if file.source.size > MAX_SMALL_FILE_SIZE:
+                        uploaded_file = await self._upload_large_file(
+                            library=library,
+                            parent=remote_parent,
+                            local_file=file.source,
+                            conflict_behavior=file.conflict_behavior,
+                            remote_name=file.remote_name,
+                        )
+                    else:
+                        uploaded_file = await self._upload_small_file(
+                            library=library,
+                            parent=remote_parent,
+                            local_file=file.source,
+                            conflict_behavior=file.conflict_behavior,
+                            existing_file=existing_file,
+                            remote_state_known=True,
+                            remote_name=file.remote_name,
+                        )
+                except Exception as error:
+                    if checkpoint_store is not None:
+                        checkpoint_store.save(result)
                     raise TreeFileUploadError(
                         f"Falha ao enviar o arquivo local '{file.source.path}' "
                         f"para o nivel remoto '{level.relative_path}' "
-                        f"(item pai '{remote_parent.id}')."
+                        f"(item pai '{remote_parent.id}').",
+                        partial_result=result,
                     ) from error
                 else:
                     uploaded_files.append(uploaded_file)
+                    remote_children[uploaded_file.remote_name.casefold()] = (
+                        uploaded_file.item
+                    )
+                    changes_since_checkpoint += 1
+                    if (
+                        checkpoint_store is not None
+                        and changes_since_checkpoint >= checkpoint_interval
+                    ):
+                        checkpoint_store.save(result)
+                        changes_since_checkpoint = 0
 
-            # Niveis sem arquivos tambem permanecem representados no resultado.
-            uploaded_tree[level.relative_path] = {remote_parent: uploaded_files}
+                    await self._notify_tree_progress(
+                        progress_callback,
+                        TreeUploadProgress(
+                            phase="uploading_files",
+                            completed_files=result.total_uploaded_files,
+                            total_files=total_files,
+                            completed_levels=len(result.completed_levels),
+                            total_levels=total_levels,
+                            current_path=file.relative_path,
+                        ),
+                    )
 
-        return uploaded_tree
+            result.completed_levels.add(level.relative_path)
+            changes_since_checkpoint += 1
+            if (
+                checkpoint_store is not None
+                and changes_since_checkpoint >= checkpoint_interval
+            ):
+                checkpoint_store.save(result)
+                changes_since_checkpoint = 0
+
+        if checkpoint_store is not None:
+            checkpoint_store.save(result)
+        await self._notify_tree_progress(
+            progress_callback,
+            TreeUploadProgress(
+                phase="completed",
+                completed_files=result.total_uploaded_files,
+                total_files=total_files,
+                completed_levels=len(result.completed_levels),
+                total_levels=total_levels,
+            ),
+        )
+        return result
 
     async def _ensure_tree(
         self,
@@ -1488,44 +1878,112 @@ class SharePointService:
         library: DocumentLibrary,
         staging_tree: StagingFilesystemTree,
         conflict_behavior: ConflictBehavior = "fail",
-    ) -> dict[PurePosixPath, SharePointItem]:
-        """Garante cada nivel remoto e o associa ao caminho relativo local."""
-        remote_tree: dict[PurePosixPath, SharePointItem] = {}
+        *,
+        result: TreeUploadResult | None = None,
+        checkpoint_store: TreeUploadCheckpointStore | None = None,
+        checkpoint_interval: int = 100,
+        cancel_event: asyncio.Event | None = None,
+    ) -> _RemoteTreeState:
+        """Materializa cada pasta uma vez e indexa os filhos de cada nivel."""
+        result = result or TreeUploadResult()
+        state = _RemoteTreeState(result=result)
+
         if not parent.is_folder:
             raise NotAFolderError(
                 "Nao foi possivel criar a arvore remota porque o item pai "
                 f"'{parent.id}' nao representa uma pasta."
             )
 
-        for level in staging_tree.levels:
-            target_path = level.relative_path
-
-            if staging_tree.target_root != PurePosixPath("."):
-                target_path = staging_tree.target_root / level.relative_path
-
+        root_relative_path = PurePosixPath(".")
+        directories_since_checkpoint = 0
+        remote_root = result.remote_directories.get(root_relative_path)
+        if remote_root is None:
             try:
-                remote_level = await self.ensure_remote_folder_path(
+                self._raise_if_tree_cancelled(cancel_event, result)
+                validate_remote_path(staging_tree.target_root)
+                remote_root = await self.ensure_remote_folder_path(
                     library=library,
                     root=parent,
-                    folders_parts=target_path.parts,
+                    folders_parts=staging_tree.target_root.parts,
                     conflict_behavior=conflict_behavior,
                 )
-            except MSCronosError as error:
+            except TreeUploadCancelledError:
+                raise
+            except Exception as error:
                 raise TreeDirectoryCreationError(
-                    "Falha ao garantir o diretorio remoto do nivel "
-                    f"'{level.relative_path}' no caminho de destino "
-                    f"'{target_path}' da biblioteca '{library.id}'."
+                    "Falha ao resolver a raiz remota da arvore no destino "
+                    f"'{staging_tree.target_root}'.",
+                    partial_result=result,
                 ) from error
-            except ODataError as error:
-                parsed_error = parse_o_data_error(
-                    error,
-                    operation="ensure_tree_directory",
-                )
+            result.remote_directories[root_relative_path] = remote_root
+            directories_since_checkpoint += 1
+
+        for level in staging_tree.levels:
+            self._raise_if_tree_cancelled(cancel_event, result)
+            remote_level = result.remote_directories.get(level.relative_path)
+            if remote_level is None:
                 raise TreeDirectoryCreationError(
-                    "O Microsoft Graph rejeitou a criacao ou resolucao do "
-                    f"nivel '{level.relative_path}' no destino '{target_path}'."
-                ) from parsed_error
+                    "A ordem top-down da arvore esta inconsistente: o nivel "
+                    f"'{level.relative_path}' foi processado antes de seu pai.",
+                    partial_result=result,
+                )
 
-            remote_tree[level.relative_path] = remote_level
+            try:
+                children = await self.list_children(
+                    library=library,
+                    parent=remote_level,
+                )
+                children_index = {
+                    child.name.casefold(): child
+                    for child in children
+                    if child.name is not None
+                }
+                state.children_by_level[level.relative_path] = children_index
 
-        return remote_tree
+                for folder in level.staging_folders:
+                    self._raise_if_tree_cancelled(cancel_event, result)
+                    target_path = staging_tree.target_root / folder.relative_path
+                    validate_remote_path(target_path)
+                    remote_folder = children_index.get(folder.remote_name.casefold())
+
+                    # Um checkpoint ja confirmou esta pasta em uma execucao
+                    # anterior. Reaproveita a referencia mesmo se a listagem
+                    # atual ainda nao a apresentar por consistencia eventual.
+                    if remote_folder is None:
+                        remote_folder = result.remote_directories.get(
+                            folder.relative_path
+                        )
+
+                    if remote_folder is not None and not remote_folder.is_folder:
+                        raise NotAFolderError(
+                            f"O destino '{target_path}' ja existe como arquivo."
+                        )
+                    if remote_folder is None:
+                        remote_folder = await self.create_folder(
+                            library=library,
+                            parent=remote_level,
+                            folder_name=folder.remote_name,
+                            conflict_behavior=conflict_behavior,
+                        )
+                        children_index[folder.remote_name.casefold()] = remote_folder
+
+                    result.remote_directories[folder.relative_path] = remote_folder
+                    directories_since_checkpoint += 1
+                    if (
+                        checkpoint_store is not None
+                        and directories_since_checkpoint >= checkpoint_interval
+                    ):
+                        checkpoint_store.save(result)
+                        directories_since_checkpoint = 0
+            except TreeUploadCancelledError:
+                raise
+            except TreeDirectoryCreationError:
+                raise
+            except Exception as error:
+                raise TreeDirectoryCreationError(
+                    "Falha ao materializar as pastas filhas do nivel "
+                    f"'{level.relative_path}' na biblioteca '{library.id}'.",
+                    partial_result=result,
+                ) from error
+
+        return state

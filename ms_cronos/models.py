@@ -33,16 +33,15 @@ Exemplo basico:
     assert sites.first() == site
 """
 
-# TODO(alpha): endurecer os contratos antes da primeira beta.
-# - validar todos os segmentos de nomes remotos segundo as regras do SharePoint;
+# TODO(beta): evolucoes planejadas antes da primeira versao estavel.
 # - definir a politica para links, sockets e outros itens locais nao regulares;
-# - modelar o resultado parcial do upload de arvore e a arvore remota criada;
+# - modelar uma arvore remota navegavel alem do resultado parcial atual;
 # - decidir se a arvore de staging deve delegar os totais de `source`;
 # - decidir se `RootUploadMode` integra o staging ou deve ser removido.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import (
@@ -57,10 +56,12 @@ from typing import (
 
 from core.errors import (
     InvalidRemoteNameError,
+    LocalFileNotReadableError,
     LocalPathError,
     LocalPathIsDirectoryError,
     LocalPathNotFoundError,
 )
+from core.urls import validate_remote_name, validate_remote_path
 
 T = TypeVar("T")
 
@@ -178,6 +179,58 @@ class FileUploadResult(CollectionItem):
     source_path: Path
     remote_name: str
     conflict_behavior: ConflictBehavior
+
+
+@dataclass
+class TreeUploadResult(CollectionItem):
+    """Registra o progresso materializado de um upload de arvore.
+
+    A instancia e preenchida nivel por nivel e pode ser reutilizada como
+    checkpoint em uma nova chamada de ``upload_tree`` dentro do mesmo processo.
+    """
+
+    source_root: Path | None = None
+    library_id: str | None = None
+    parent_item_id: str | None = None
+    target_root: PurePosixPath | None = None
+    staging_fingerprint: str | None = None
+    remote_directories: dict[PurePosixPath, SharePointItem] = field(
+        default_factory=dict
+    )
+    uploaded_files: dict[PurePosixPath, list[FileUploadResult]] = field(
+        default_factory=dict
+    )
+    completed_levels: set[PurePosixPath] = field(default_factory=set)
+
+    @property
+    def total_uploaded_files(self) -> int:
+        """Retorna a quantidade de arquivos confirmados pelo Graph."""
+        return sum(len(files) for files in self.uploaded_files.values())
+
+
+TreeUploadPhase = Literal[
+    "preparing_directories",
+    "uploading_files",
+    "completed",
+]
+
+
+@dataclass(frozen=True)
+class TreeUploadProgress:
+    """Snapshot imutavel do progresso observado durante um upload de arvore."""
+
+    phase: TreeUploadPhase
+    completed_files: int
+    total_files: int
+    completed_levels: int
+    total_levels: int
+    current_path: PurePosixPath | None = None
+
+
+TreeUploadProgressCallback = Callable[
+    [TreeUploadProgress],
+    Awaitable[None] | None,
+]
 
 
 class Collection_(Generic[T], ABC):
@@ -395,11 +448,19 @@ class RootFolder:
 
     def __post_init__(self):
         """Valida a existencia da raiz e a correspondencia de seu nome."""
-        assert self.path.exists(), f"O diretorio raiz local nao existe: '{self.path}'."
-        assert self.name == self.path.name, (
-            f"O nome da raiz deve ser '{self.path.name}', mas foi recebido "
-            f"'{self.name}'."
-        )
+        if not self.path.exists():
+            raise LocalPathNotFoundError(
+                f"O diretorio raiz local nao existe: '{self.path}'."
+            )
+        if not self.path.is_dir():
+            raise LocalPathError(
+                f"A raiz local deve representar um diretorio: '{self.path}'."
+            )
+        if self.name != self.path.name:
+            raise LocalPathError(
+                f"O nome da raiz deve ser '{self.path.name}', mas foi recebido "
+                f"'{self.name}'."
+            )
 
     @classmethod
     def from_uri(cls, path: str | Path) -> Self:
@@ -419,7 +480,7 @@ class LocalFolder(CollectionItem):
     """Referencia enxuta e opaca de um subdiretorio encontrado no disco.
 
     O modelo descreve somente o recurso local. Sua correspondencia com uma
-    pasta remota sera responsabilidade futura de `StagingFolder`.
+    pasta remota pertence a `StagingFolder` e ao executor de upload.
 
     Exemplo:
         folder = LocalFolder.from_uri('/tmp/documentos/relatorios')
@@ -430,11 +491,19 @@ class LocalFolder(CollectionItem):
 
     def __post_init__(self):
         """Valida a existencia da pasta e a correspondencia de seu nome."""
-        assert self.path.exists(), f"O diretorio local nao existe: '{self.path}'."
-        assert self.name == self.path.name, (
-            f"O nome da pasta deve ser '{self.path.name}', mas foi recebido "
-            f"'{self.name}'."
-        )
+        if not self.path.exists():
+            raise LocalPathNotFoundError(
+                f"O diretorio local nao existe: '{self.path}'."
+            )
+        if not self.path.is_dir():
+            raise LocalPathError(
+                f"O caminho local deve representar um diretorio: '{self.path}'."
+            )
+        if self.name != self.path.name:
+            raise LocalPathError(
+                f"O nome da pasta deve ser '{self.path.name}', mas foi recebido "
+                f"'{self.name}'."
+            )
 
     @classmethod
     def from_uri(cls, path: str | Path) -> Self:
@@ -466,22 +535,38 @@ class LocalFile(CollectionItem):
 
     def __post_init__(self):
         """Valida metadados e aplica a politica para arquivos vazios."""
-        assert self.path.exists(), f"O arquivo local nao existe: '{self.path}'."
-        assert self.name == self.path.name, (
-            f"O nome do arquivo deve ser '{self.path.name}', mas foi recebido "
-            f"'{self.name}'."
-        )
-        assert self.extension == self.path.suffix, (
-            f"A extensao do arquivo deve ser '{self.path.suffix}', mas foi "
-            f"recebido '{self.extension}'."
-        )
-        if self.allow_empty == "deny":
-            assert self.size > 0, (
-                f"O arquivo '{self.path}' deve possuir ao menos um byte."
+        if not self.path.exists():
+            raise LocalPathNotFoundError(f"O arquivo local nao existe: '{self.path}'.")
+        if not self.path.is_file():
+            if self.path.is_dir():
+                raise LocalPathIsDirectoryError(
+                    f"O caminho local aponta para um diretorio: '{self.path}'."
+                )
+            raise LocalPathError(
+                f"O caminho local nao representa um arquivo regular: '{self.path}'."
             )
-        if self.allow_empty == "allow":
-            assert self.size >= 0, (
+        if self.name != self.path.name:
+            raise LocalPathError(
+                f"O nome do arquivo deve ser '{self.path.name}', mas foi recebido "
+                f"'{self.name}'."
+            )
+        if self.extension != self.path.suffix:
+            raise LocalPathError(
+                f"A extensao do arquivo deve ser '{self.path.suffix}', mas foi "
+                f"recebido '{self.extension}'."
+            )
+        if self.allow_empty not in {"allow", "deny"}:
+            raise ValueError(
+                "allow_empty deve ser 'allow' ou 'deny'; recebido: "
+                f"{self.allow_empty!r}."
+            )
+        if self.size < 0:
+            raise LocalFileNotReadableError(
                 f"O tamanho do arquivo nao pode ser negativo: {self.size}."
+            )
+        if self.allow_empty == "deny" and self.size == 0:
+            raise LocalFileNotReadableError(
+                f"O arquivo '{self.path}' deve possuir ao menos um byte."
             )
 
     @classmethod
@@ -492,6 +577,18 @@ class LocalFile(CollectionItem):
         sao verificadas pelo `__post_init__`.
         """
         resolved_path = Path(path)
+        if not resolved_path.exists():
+            raise LocalPathNotFoundError(
+                f"O arquivo local nao existe: '{resolved_path}'."
+            )
+        if not resolved_path.is_file():
+            if resolved_path.is_dir():
+                raise LocalPathIsDirectoryError(
+                    f"O caminho local aponta para um diretorio: '{resolved_path}'."
+                )
+            raise LocalPathError(
+                f"O caminho local nao representa um arquivo: '{resolved_path}'."
+            )
         suffix = resolved_path.suffix
         return cls(
             path=resolved_path,
@@ -506,7 +603,8 @@ class LocalFile(CollectionItem):
         Esta operacao altera o filesystem local. Ela nao serve apenas para
         escolher um nome remoto diferente.
         """
-        assert len(name) > 0
+        if not name.strip():
+            raise LocalPathError("O novo nome local nao pode ser vazio.")
 
         parent = self.path.parent
         new_path = parent / name
@@ -546,6 +644,23 @@ class DirectoryLevel(CollectionItem):
     path: Path  # Caminho absoluto do diretorio representado por este nivel.
     files: LocalFileCollection  # Arquivos diretamente contidos no nivel.
     folders: LocalFolderCollection  # Subdiretorios diretamente contidos.
+
+    def __post_init__(self) -> None:
+        """Valida o diretorio e a pertinencia de seus filhos imediatos."""
+        if not self.path.exists():
+            raise LocalPathNotFoundError(
+                f"O diretorio do nivel local nao existe: '{self.path}'."
+            )
+        if not self.path.is_dir():
+            raise LocalPathError(
+                f"O nivel local deve representar um diretorio: '{self.path}'."
+            )
+        for child in (*self.files, *self.folders):
+            if child.path.parent != self.path:
+                raise LocalPathError(
+                    f"O recurso '{child.path}' nao e filho imediato do nivel "
+                    f"'{self.path}'."
+                )
 
     @property
     def total_size(self) -> int:
@@ -590,9 +705,9 @@ class FilesystemTree:
     encontrado, preferencialmente em ordem top-down, sem carregar em memoria o
     conteudo binario dos arquivos.
 
-    Esta classe descreve o disco e nao deve conhecer o SharePoint. Um conversor
-    futuro produzira `StagingFilesystemTree`, que sera o contrato de entrada do
-    upload de diretorios.
+    Esta classe descreve o disco e nao deve conhecer o SharePoint.
+    `StagingTreeBuilder` produz o `StagingFilesystemTree` consumido pelo upload
+    de diretorios.
     """
 
     root: RootFolder
@@ -600,14 +715,23 @@ class FilesystemTree:
 
     def __post_init__(self):
         """Confirma que os recursos do snapshot ainda existem no disco."""
-        assert self.root.path.exists()
-
+        root_path = self.root.path.resolve()
+        if not self.levels:
+            raise LocalPathError(
+                f"A arvore local deve conter o nivel raiz '{root_path}'."
+            )
+        if self.levels[0].path.resolve() != root_path:
+            raise LocalPathError(
+                "O primeiro nivel da arvore deve representar a raiz local: "
+                f"esperado '{root_path}', recebido '{self.levels[0].path}'."
+            )
         for level in self.levels:
-            assert level.path.exists()
-            for dir in level.folders:
-                assert dir.path.exists()
-            for file in level.files:
-                assert file.path.exists()
+            try:
+                level.path.resolve().relative_to(root_path)
+            except ValueError as error:
+                raise LocalPathError(
+                    f"O nivel '{level.path}' esta fora da raiz '{root_path}'."
+                ) from error
 
     @property
     def total_size(self) -> int:
@@ -632,7 +756,7 @@ class FilesystemTree:
 
 # Os modelos locais acima descrevem o snapshot observado no disco. Os modelos
 # abaixo acrescentam caminhos relativos e destinos para formar o plano
-# semantico que sera consumido pelo futuro orquestrador de upload.
+# semantico consumido pelo orquestrador de upload.
 
 
 @dataclass(frozen=True)
@@ -689,6 +813,7 @@ class StagingFile(CollectionItem):
                 "O nome remoto do arquivo nao pode ser vazio ou conter apenas "
                 f"espacos. Origem local: {self.source.path}."
             )
+        validate_remote_name(self.remote_name)
 
 
 @dataclass(frozen=True)
@@ -733,6 +858,7 @@ class StagingFolder(CollectionItem):
                 "O nome remoto da pasta nao pode ser vazio ou conter apenas "
                 f"espacos. Origem local: {self.source.path}."
             )
+        validate_remote_name(self.remote_name)
 
 
 @dataclass(frozen=True)
@@ -816,13 +942,4 @@ class StagingFilesystemTree:
 
     def __post_init__(self):
         """Valida o fragmento remoto usado como raiz da arvore preparada."""
-        if self.target_root.is_absolute():
-            raise InvalidRemoteNameError(
-                "target_root deve ser um fragmento remoto relativo ao pai, "
-                f"mas foi recebido um caminho absoluto: '{self.target_root}'."
-            )
-        if ".." in self.target_root.parts:
-            raise InvalidRemoteNameError(
-                "target_root nao pode sair do pai remoto usando '..': "
-                f"'{self.target_root}'."
-            )
+        validate_remote_path(self.target_root)

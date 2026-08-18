@@ -10,8 +10,9 @@ from typing import cast
 from msgraph.generated.models.drive_item import DriveItem
 from msgraph.generated.models.folder import Folder
 
-from core.errors import InvalidConflictBehaviorError, InvalidRemoteNameError
+from core.errors import InvalidConflictBehaviorError
 from core.models import ConflictBehavior
+from core.urls import validate_remote_name
 
 ALLOWED_CONFLICT_BEHAVIORS = frozenset({"fail", "rename", "replace"})
 
@@ -27,18 +28,6 @@ def normalize_conflict_behavior(conflict_behavior: str) -> ConflictBehavior:
     return cast(ConflictBehavior, normalized_behavior)
 
 
-def _normalize_remote_name(name: str) -> str:
-    """Normaliza e valida um nome remoto simples de arquivo ou pasta."""
-    normalized_name = name.strip()
-    if not normalized_name:
-        raise InvalidRemoteNameError("O nome remoto nao pode ser vazio.")
-    if "/" in normalized_name or "\\" in normalized_name:
-        raise InvalidRemoteNameError(
-            f"O nome remoto deve ser um nome simples, nao um caminho: {name!r}."
-        )
-    return normalized_name
-
-
 def build_folder_drive_item(
     name: str,
     conflict_behavior: ConflictBehavior = "fail",
@@ -48,7 +37,7 @@ def build_folder_drive_item(
     O Graph espera um `DriveItem` com `name`, a facet `folder` e o valor
     especial `@microsoft.graph.conflictBehavior` em `additional_data`.
     """
-    folder_name = _normalize_remote_name(name)
+    folder_name = validate_remote_name(name)
     normalized_behavior = normalize_conflict_behavior(conflict_behavior)
 
     body = DriveItem(name=folder_name, folder=Folder())

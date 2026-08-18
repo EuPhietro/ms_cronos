@@ -7,10 +7,9 @@ O projeto oferece modelos de dominio pequenos e uma API de alto nivel para que
 aplicacoes consumidoras nao precisem lidar diretamente com `DriveItem`,
 envelopes OData, URLs de continuacao ou detalhes de upload do SDK.
 
-> Status: desenvolvimento ativo. A navegacao remota e os uploads de arquivos
-> individuais estao funcionais. O scanner local tambem esta funcional, mas a
-> conversao da arvore para staging e o upload completo de diretorios ainda nao
-> foram implementados. A API pode mudar antes da primeira versao beta.
+> Status: **Beta 1 (`0.1.0b1`)**. Navegacao remota, scanner local, staging,
+> upload sequencial de arvores, checkpoint persistente e progresso observavel
+> estao funcionais. Mudancas incompativeis ainda podem ocorrer antes da `1.0`.
 
 ## Recursos
 
@@ -28,10 +27,12 @@ envelopes OData, URLs de continuacao ou detalhes de upload do SDK.
 - scanner recursivo de diretorios locais baseado em `Path.walk()`;
 - snapshot plano com contadores de arquivos, diretorios, niveis e bytes;
 - preservacao de diretorios vazios no snapshot local;
+- upload top-down de arvores completas com cache dos filhos remotos;
+- checkpoint JSON atomico e resultado parcial para retomada de arvores;
+- callback de progresso e cancelamento cooperativo;
+- retry com `Retry-After` e backoff para falhas transitorias do Graph;
+- validacao centralizada de nomes e fragmentos remotos;
 - traducao de erros OData para excecoes do Core.
-
-O objetivo seguinte e converter `FilesystemTree` em um plano de staging e
-enviar arvores completas, preservando sua estrutura no SharePoint.
 
 ## Modelo Conceitual
 
@@ -47,7 +48,9 @@ DriveItem             ->     SharePointItem
 arquivo no disco      ->     LocalFile
 diretorio no disco    ->     DirectoryLevel
 arvore local          ->     FilesystemTree
+plano de upload       ->     StagingFilesystemTree
 resultado de upload   ->     FileUploadResult
+resultado da arvore   ->     TreeUploadResult
 ```
 
 As operacoes de `SharePointService` convertem objetos e envelopes do SDK antes
@@ -68,7 +71,7 @@ A partir de um checkout do repositorio:
 python -m venv venv
 source venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -e ".[dev]"
 ```
 
 No PowerShell:
@@ -77,19 +80,28 @@ No PowerShell:
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -e ".[dev]"
 ```
 
-O projeto ainda nao possui uma distribuicao publicada no PyPI.
+O pacote possui metadados de distribuicao em `pyproject.toml`, mas ainda nao
+foi publicado no PyPI.
+
+O codigo-fonte e distribuido publicamente em
+[github.com/EuPhietro/ms_cronos](https://github.com/EuPhietro/ms_cronos).
 
 ## Configuracao
 
-Crie um arquivo `.env` local:
+Use `.env.example` como referencia para criar um arquivo `.env` local:
 
 ```env
 CLIENT_ID=identificador-da-aplicacao
 CLIENT_SECRET=segredo-da-aplicacao
 CLIENT_TENANT=identificador-do-tenant
+UPLOAD_SOURCE=/dados/documentos
+UPLOAD_CHECKPOINT=.ms-cronos-upload.json
+SHAREPOINT_SITE_URL=https://tenant.sharepoint.com/sites/Financeiro
+SHAREPOINT_LIBRARY=Documents
+SHAREPOINT_TARGET_ROOT=backup
 ```
 
 Nunca envie `.env`, client secrets, tokens ou URLs pre-autenticadas de upload
@@ -181,7 +193,49 @@ snapshot precisar representar arquivos vazios. `sort_entries=True` torna a
 ordem deterministica; sem essa opcao, a ordem segue o sistema de arquivos.
 
 O scanner nao conhece sites, bibliotecas, caminhos remotos nem politicas de
-conflito. Essa associacao pertencera aos futuros modelos de staging.
+conflito. `StagingTreeBuilder` faz essa associacao sem executar chamadas de
+rede.
+
+## Upload De Arvores
+
+```python
+import asyncio
+from pathlib import PurePosixPath
+
+cancel_event = asyncio.Event()
+
+
+def report_progress(progress: TreeUploadProgress) -> None:
+    print(progress.phase, progress.completed_files, progress.total_files)
+
+
+staging_tree = StagingTreeBuilder().build_staging_tree(
+    tree,
+    conflict_behavior="replace",
+    target_root=PurePosixPath("backup/documentos"),
+)
+
+result = await sharepoint.upload_tree(
+    root,
+    library,
+    staging_tree,
+    checkpoint_path=".ms-cronos-upload.json",
+    checkpoint_interval=100,
+    progress_callback=report_progress,
+    cancel_event=cancel_event,
+)
+
+print(result.total_uploaded_files)
+```
+
+O executor cria as pastas de cima para baixo, lista cada nivel remoto uma vez
+por execucao e reutiliza esse indice durante os uploads. Quando
+`checkpoint_path` existe, ele e carregado automaticamente. O checkpoint e
+vinculado ao caminho local, biblioteca, pai remoto e `target_root`, impedindo
+retomada acidental em outro destino. Uma impressao digital de caminhos, nomes,
+tamanhos e politicas de conflito tambem rejeita uma arvore de staging
+estruturalmente diferente. `TreeUploadError.partial_result` continua disponivel
+para tratamento em memoria.
 
 ## Navegacao Remota
 
@@ -388,33 +442,39 @@ parte da API estavel do pacote.
 
 ## Desenvolvimento
 
-`main.py` funciona atualmente como verificacao manual do scanner local:
+`main.py` funciona como verificacao manual do fluxo completo:
 
 ```bash
 python main.py
 ```
 
-O repositorio ainda nao possui uma suite automatizada de testes. O scanner ja
-foi exercitado manualmente com uma arvore de 45.779 arquivos, 21.862 niveis e
-554.889.293 bytes, mas esse resultado nao substitui testes reproduziveis.
+Execute a suite reproduzivel com:
 
-Antes da beta, o projeto precisa ao menos de testes unitarios para models,
-scanner, parsers, paginacao e montagem do staging, alem de um teste de
-integracao controlado para upload de diretorios.
+```bash
+python -m unittest discover -v
+ruff check core tests main.py
+pyright --pythonpath venv/bin/python core
+```
+
+Ela cobre scanner, staging, paginação, conflitos, retry, validacao remota,
+cache, checkpoint, progresso, cancelamento e API publica. O teste Graph somente
+leitura fica desativado por padrao. Para executa-lo em um tenant controlado:
+
+```bash
+MS_CRONOS_RUN_INTEGRATION=1 python -m unittest \
+  tests.test_integration_readonly -v
+```
+
+O scanner tambem foi exercitado manualmente com uma arvore de 45.779 arquivos,
+21.862 niveis e 554.889.293 bytes.
 
 ## Roadmap
 
-- corrigir as inconsistencias de assinatura registradas em `docs/SPEC.md`;
-- definir os modelos `StagingFile`, `StagingFolder`,
-  `StagingDirectoryLevel` e `StagingFilesystemTree`;
-- implementar a conversao de `FilesystemTree` para staging remoto;
-- implementar upload recursivo de diretorios;
-- adicionar resultados agregados e relatorios de falha parcial;
-- implementar retries para throttling e erros transitorios;
-- adicionar testes automatizados e uma matriz minima de integracao;
-- consolidar a superficie publica com `__all__`;
-- manter parsers e builders fora dos exports publicos;
-- preparar empacotamento e versionamento.
+- adicionar concorrencia limitada com controle adaptativo de throttling;
+- ampliar a matriz de integracao com uploads em um destino descartavel;
+- endurecer a retomada de uploads grandes interrompidos no meio de um chunk;
+- modelar uma arvore remota navegavel;
+- preparar publicacao da distribuicao.
 
 ## Seguranca
 
@@ -431,5 +491,4 @@ integracao controlado para upload de diretorios.
 
 ## Licenca
 
-Este repositorio ainda nao inclui um arquivo de licenca. Antes de reutilizar ou
-redistribuir o projeto, aguarde a publicacao dos termos aplicaveis.
+Distribuido sob a licenca MIT. Consulte [`LICENSE`](LICENSE).

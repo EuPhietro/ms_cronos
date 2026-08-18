@@ -9,11 +9,14 @@ Exemplo:
     )
 """
 
+from pathlib import PurePosixPath
 from urllib.parse import quote, urlparse
 
 from core.errors import InvalidRemoteNameError, SharePointUrlError
 
 INVALID_REMOTE_NAME_CHARACTERS = frozenset('"*:<>?/\\|')
+MAX_REMOTE_NAME_LENGTH = 255
+MAX_REMOTE_PATH_LENGTH = 400
 RESERVED_REMOTE_NAMES = frozenset(
     {
         ".lock",
@@ -26,6 +29,65 @@ RESERVED_REMOTE_NAMES = frozenset(
         *(f"lpt{index}" for index in range(10)),
     }
 )
+
+
+def validate_remote_name(name: str) -> str:
+    """Valida um unico nome de arquivo ou pasta do SharePoint.
+
+    O nome permanece decodificado. Percent-encoding pertence exclusivamente a
+    fronteira que monta URLs para o Microsoft Graph.
+    """
+    if not name or name != name.strip():
+        raise InvalidRemoteNameError(
+            "O nome remoto nao pode ser vazio nem conter espacos nas extremidades: "
+            f"{name!r}."
+        )
+    if len(name) > MAX_REMOTE_NAME_LENGTH:
+        raise InvalidRemoteNameError(
+            f"O nome remoto excede {MAX_REMOTE_NAME_LENGTH} caracteres: {name!r}."
+        )
+    if name in {".", ".."}:
+        raise InvalidRemoteNameError(
+            f"O segmento remoto {name!r} nao pode representar navegacao de caminho."
+        )
+    if name.endswith("."):
+        raise InvalidRemoteNameError(
+            f"O nome remoto nao pode terminar com ponto: {name!r}."
+        )
+    if any(character in INVALID_REMOTE_NAME_CHARACTERS for character in name):
+        raise InvalidRemoteNameError(
+            f"O nome remoto contem caracteres proibidos: {name!r}."
+        )
+
+    normalized_name = name.casefold()
+    device_name = normalized_name.split(".", maxsplit=1)[0]
+    if (
+        normalized_name in RESERVED_REMOTE_NAMES
+        or device_name in RESERVED_REMOTE_NAMES
+        or normalized_name.startswith("~$")
+        or "_vti_" in normalized_name
+    ):
+        raise InvalidRemoteNameError(
+            f"O nome remoto e reservado pelo SharePoint: {name!r}."
+        )
+    return name
+
+
+def validate_remote_path(path: PurePosixPath) -> PurePosixPath:
+    """Valida um fragmento remoto relativo e todos os seus segmentos."""
+    if path.is_absolute():
+        raise InvalidRemoteNameError(
+            f"O caminho remoto deve ser relativo ao item pai: '{path}'."
+        )
+    if path != PurePosixPath("."):
+        for segment in path.parts:
+            validate_remote_name(segment)
+    if len(path.as_posix()) > MAX_REMOTE_PATH_LENGTH:
+        raise InvalidRemoteNameError(
+            "O fragmento remoto excede o limite de "
+            f"{MAX_REMOTE_PATH_LENGTH} caracteres: '{path}'."
+        )
+    return path
 
 
 def validate_graph_url(url: str, strict_validate: bool = False) -> bool:
@@ -100,30 +162,7 @@ def build_create_content_url(filename: str) -> str:
     `:/curriculo.pdf:/content`. O nome permanece semantico nas camadas
     anteriores e recebe percent-encoding somente nesta fronteira de URL.
     """
-    if not filename or filename != filename.strip():
-        raise InvalidRemoteNameError(
-            "O nome remoto do arquivo nao pode ser vazio nem conter espacos "
-            "nas extremidades."
-        )
-    if filename.endswith("."):
-        raise InvalidRemoteNameError(
-            f"O nome remoto do arquivo nao pode terminar com ponto: {filename}."
-        )
-    if any(character in INVALID_REMOTE_NAME_CHARACTERS for character in filename):
-        raise InvalidRemoteNameError(
-            f"O nome remoto do arquivo contem caracteres proibidos: {filename}."
-        )
-
-    normalized_name = filename.casefold()
-    if normalized_name in RESERVED_REMOTE_NAMES:
-        raise InvalidRemoteNameError(
-            f"O nome remoto do arquivo e reservado pelo SharePoint: {filename}."
-        )
-    if normalized_name.startswith("~$") or "_vti_" in normalized_name:
-        raise InvalidRemoteNameError(
-            f"O nome remoto do arquivo e reservado pelo SharePoint: {filename}."
-        )
-
+    validate_remote_name(filename)
     encoded_filename = quote(filename, safe="")
     return f":/{encoded_filename}:/content"
 

@@ -228,6 +228,25 @@ class GraphResponseError(GraphRequestError):
         super().__init__(*args)
 
 
+class GraphTransportError(GraphRequestError):
+    """Use quando a conexao com o Microsoft Graph falhar antes de uma resposta."""
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+
+class CheckpointError(MSCronosError):
+    """Erro base para leitura, gravacao ou validacao de checkpoints."""
+
+
+class CheckpointFormatError(CheckpointError):
+    """Use quando um checkpoint nao possuir o schema esperado pelo Core."""
+
+
+class CheckpointMismatchError(CheckpointError):
+    """Use quando o checkpoint pertencer a outra origem ou destino remoto."""
+
+
 # ---- ERROS DE CRIAÇÃO DE RECURSOS ----
 
 
@@ -256,22 +275,25 @@ class UploadError(MSCronosError):
 class TreeUploadError(UploadError):
     """Use como erro base da materializacao e do upload de uma arvore."""
 
-    def __init__(self, *args: object) -> None:
+    def __init__(self, *args: object, partial_result: object | None = None) -> None:
+        self.partial_result = partial_result
         super().__init__(*args)
 
 
 class TreeDirectoryCreationError(TreeUploadError):
     """Use quando um nivel da arvore nao puder ser resolvido ou criado."""
 
-    def __init__(self, *args: object) -> None:
-        super().__init__(*args)
+    pass
 
 
 class TreeFileUploadError(TreeUploadError):
     """Use quando um arquivo falhar durante o upload sequencial da arvore."""
 
-    def __init__(self, *args: object) -> None:
-        super().__init__(*args)
+    pass
+
+
+class TreeUploadCancelledError(TreeUploadError):
+    """Use quando o chamador solicitar o cancelamento cooperativo da arvore."""
 
 
 class SmallFileUploadError(UploadError):

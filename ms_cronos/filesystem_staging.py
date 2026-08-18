@@ -21,7 +21,6 @@ item remoto escolhido como pai e nunca uma URL completa do Graph.
 
 from pathlib import Path, PurePosixPath
 
-from core.errors import InvalidRemoteNameError
 from core.models import (
     ConflictBehavior,
     DirectoryLevel,
@@ -39,6 +38,7 @@ from core.models import (
     StagingFolder,
     StagingFolderCollection,
 )
+from core.urls import validate_remote_path
 
 
 class StagingTreeBuilder:
@@ -76,17 +76,7 @@ class StagingTreeBuilder:
             InvalidRemoteNameError: Se ``target_root`` contiver um segmento
                 remoto invalido.
         """
-        if target_root != PurePosixPath("."):
-            for segment in target_root.parts:
-                if not segment.strip():
-                    raise InvalidRemoteNameError(
-                        f"O destino remoto contem um segmento vazio: '{target_root}'."
-                    )
-                if segment.endswith("."):
-                    raise InvalidRemoteNameError(
-                        "Um segmento do destino remoto nao pode terminar com "
-                        f"ponto: '{segment}'."
-                    )
+        validate_remote_path(target_root)
         return StagingFilesystemTree(
             source=tree,
             levels=self._build_staging_directory_level_collection(

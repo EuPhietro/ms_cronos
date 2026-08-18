@@ -16,20 +16,23 @@ Fluxo remoto
 GraphClientManager -> SharePointService -> SharePoint
 
 Fluxo local
-LocalFileSystemScanner -> FilesystemTree -> staging futuro -> upload futuro
+LocalFileSystemScanner -> FilesystemTree -> StagingTreeBuilder
+    -> StagingFilesystemTree -> SharePointService.upload_tree
 ```
 
-Navegacao, criacao de pastas e uploads individuais estao implementados. O
-scanner local tambem esta implementado. A associacao entre uma arvore local e
-uma arvore remota ainda nao existe.
+Navegacao, criacao de pastas, uploads individuais, staging e upload sequencial
+de arvores estao implementados. A versao atual e `0.1.0b1`.
+`TreeUploadResult` registra progresso e `TreeUploadCheckpointStore` persiste o
+estado entre processos.
 
 ## Ambiente
 
 - Python minimo: 3.12;
 - SDK principal: `msgraph-sdk==1.58.0`;
 - entrada publica recomendada: `from core import ...`;
-- `main.py`: verificacao manual do scanner local;
-- testes automatizados: ainda inexistentes.
+- `main.py`: exemplo manual configurado somente por variaveis de ambiente;
+- testes automatizados: scanner, staging, paginacao, conflito, retry,
+  checkpoint, progresso, cancelamento e API publica.
 
 Ao inventariar o repositorio, ignore:
 
@@ -54,13 +57,15 @@ __pycache__/
 7. `core/builders.py` e `core/urls.py`: payloads e rotas.
 8. `core/errors.py`: taxonomia de falhas.
 9. `core/graph_client.py`: autenticacao e ciclo de vida.
-10. `core/__init__.py`: superficie atualmente reexportada.
+10. `core/checkpoint.py`: persistencia do progresso.
+11. `core/__init__.py`: superficie publica definida por `__all__`.
 
 ## Mapa De Modulos
 
 ```text
 core/
-├── __init__.py       # reexports atuais
+├── __init__.py       # API publica e versao
+├── checkpoint.py     # checkpoint JSON atomico
 ├── builders.py       # payload de pasta e politicas de conflito
 ├── errors.py         # erros semanticos
 ├── filesystem.py     # scanner local
@@ -170,11 +175,20 @@ result = await service.upload(
 
 `upload()` seleciona:
 
-- `PUT /content` ate `250_000_000` bytes;
+- `PUT /content` ate `10 * 1024 * 1024` bytes;
 - upload session acima desse limite;
-- chunks de ate `60 * 1024 * 1024` bytes no fluxo grande.
+- chunks de `10 * 1024 * 1024` bytes no fluxo grande.
 
 O retorno sempre deve permanecer `FileUploadResult`.
+
+`upload_tree()` cria a estrutura top-down, indexa uma vez os filhos de cada
+nivel e devolve `TreeUploadResult`. `checkpoint_path` permite retomada entre
+processos; em falhas, o mesmo estado permanece em
+`TreeUploadError.partial_result`.
+
+O binding do checkpoint inclui uma impressao digital estrutural, mas nao um
+hash do conteudo de cada arquivo. Nao trate o checkpoint como verificacao de
+integridade binaria.
 
 ## API Local
 
@@ -228,29 +242,23 @@ permitem reconstruir a hierarquia.
 
 ## Inconsistencias Que Nao Devem Ser Escondidas
 
-1. `parse_local_file()` pode passar `None` como extensao.
-2. `find_file_by_name()` possui dois parametros sem anotacao.
-3. `LocalFile.rename_on_disk()` renomeia fisicamente o arquivo local.
-4. a politica `allow_empty` do scanner nao e aceita pelo uploader atual.
-5. helpers internos ainda sao reexportados por `core/__init__.py`.
-6. nao ha testes automatizados.
+1. `LocalFile.rename_on_disk()` renomeia fisicamente o arquivo local.
+2. a politica `allow_empty` do scanner nao e aceita pelo uploader atual.
+3. checkpoints retomam arquivos confirmados, nao chunks de uma sessao.
+4. a integracao Graph e opt-in e somente leitura.
 
 Nao corrija esses pontos incidentalmente durante uma tarefa exclusivamente
 documental. Registre ou trate cada um com escopo e teste proprios.
 
 ## Fase Seguinte
 
-Implementar, nesta ordem:
+Evoluir, nesta ordem:
 
-1. modelos `StagingFile` e `StagingFolder`;
-2. colecoes de staging;
-3. `StagingDirectoryLevel`;
-4. `StagingFilesystemTree`;
-5. builder que calcula paths relativos e destinos;
-6. orquestrador que cria pastas antes dos arquivos;
-7. resultado agregado e politica de falha parcial;
-8. retry/backoff para throttling e erros transitorios;
-9. testes unitarios e integracao controlada.
+1. retomada robusta de upload sessions interrompidas;
+2. concorrencia limitada com controle de throttling;
+3. integracao mutavel em destino descartavel;
+4. arvore remota navegavel;
+5. publicacao da distribuicao no PyPI.
 
 O fluxo alvo e:
 
@@ -268,13 +276,10 @@ FilesystemTree
 Para alteracoes de codigo:
 
 ```bash
-python -m compileall core main.py
-```
-
-Quando os testes forem adicionados:
-
-```bash
-python -m pytest
+ruff check core tests main.py
+pyright --pythonpath venv/bin/python core
+python -m compileall core tests main.py
+python -m unittest discover -v
 ```
 
 Tambem confira:

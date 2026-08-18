@@ -1,4 +1,4 @@
-"""Execucao manual simples do scanner de diretorios locais."""
+"""Exemplo executavel do upload de uma arvore local."""
 
 import asyncio
 import os
@@ -7,11 +7,15 @@ from pathlib import Path, PurePosixPath
 from dotenv import load_dotenv
 from rich.traceback import install
 
-from core import LocalFileSystemScanner, StagingTreeBuilder
-from core.errors import DriveNotFoundError
-from core.graph_client import GraphClientManager
-from core.models import GraphCredentials
-from core.sharepoint import SharePointService
+from core import (
+    DriveNotFoundError,
+    GraphClientManager,
+    GraphCredentials,
+    LocalFileSystemScanner,
+    SharePointService,
+    StagingTreeBuilder,
+    TreeUploadProgress,
+)
 
 load_dotenv()
 install(show_locals=False)
@@ -22,10 +26,20 @@ async def main() -> None:
     client_secret = os.getenv("CLIENT_SECRET", "")
     client_tenant = os.getenv("CLIENT_TENANT", "")
     upload_source = os.getenv("UPLOAD_SOURCE", "")
+    site_url = os.getenv("SHAREPOINT_SITE_URL", "")
+    library_name = os.getenv("SHAREPOINT_LIBRARY", "")
+    target_root = os.getenv("SHAREPOINT_TARGET_ROOT", ".")
+    checkpoint_path = os.getenv("UPLOAD_CHECKPOINT") or None
 
-    if not upload_source.strip():
+    required = {
+        "UPLOAD_SOURCE": upload_source,
+        "SHAREPOINT_SITE_URL": site_url,
+        "SHAREPOINT_LIBRARY": library_name,
+    }
+    missing = [name for name, value in required.items() if not value.strip()]
+    if missing:
         raise ValueError(
-            "Defina UPLOAD_SOURCE com o diretorio local que deve ser enviado."
+            f"Defina as variaveis obrigatorias antes da execucao: {', '.join(missing)}."
         )
 
     graph_credentials = GraphCredentials(
@@ -49,27 +63,35 @@ async def main() -> None:
         staging_tree = builder.build_staging_tree(
             tree=tree,
             conflict_behavior="replace",
-            target_root=PurePosixPath("ms_cronos"),
+            target_root=PurePosixPath(target_root),
         )
 
-        site = await sharepoint.resolve_site(
-            "https://plangeconcombr.sharepoint.com/sites/RHConecta"
-        )
+        site = await sharepoint.resolve_site(site_url)
 
-        drive = await sharepoint.find_drive_by_name(site=site, name="SESMT")
+        drive = await sharepoint.find_drive_by_name(site=site, name=library_name)
 
         if drive is None:
             raise DriveNotFoundError(
-                "A biblioteca de documentos 'SESMT' nao foi encontrada no site."
+                f"A biblioteca de documentos '{library_name}' nao foi encontrada."
             )
         remote_root = await sharepoint.get_drive_root(drive)
 
-        await sharepoint.upload_tree(
+        def show_progress(progress: TreeUploadProgress) -> None:
+            print(
+                f"[{progress.phase}] arquivos "
+                f"{progress.completed_files}/{progress.total_files}; niveis "
+                f"{progress.completed_levels}/{progress.total_levels}"
+            )
+
+        result = await sharepoint.upload_tree(
             parent=remote_root,
             library=drive,
             staging_tree=staging_tree,
             conflict_behavior="replace",
+            checkpoint_path=checkpoint_path,
+            progress_callback=show_progress,
         )
+        print(f"Upload concluido: {result.total_uploaded_files} arquivo(s).")
 
 
 if __name__ == "__main__":

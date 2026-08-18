@@ -18,6 +18,7 @@ from types import TracebackType
 from azure.identity.aio import ClientSecretCredential
 from msgraph.graph_service_client import GraphServiceClient
 
+from core.errors import GraphConfigurationError
 from core.models import GraphCredentials
 
 DEFAULT_SCOPES: tuple[str, ...] = ("https://graph.microsoft.com/.default",)
@@ -98,19 +99,27 @@ class GraphClientManager:
     @staticmethod
     def _validate_credentials(credentials: GraphCredentials) -> None:
         if not credentials.client_id.strip():
-            raise ValueError("GraphCredentials.client_id nao pode ser vazio.")
+            raise GraphConfigurationError(
+                "GraphCredentials.client_id nao pode ser vazio."
+            )
         if not credentials.client_secret.strip():
-            raise ValueError("GraphCredentials.client_secret nao pode ser vazio.")
+            raise GraphConfigurationError(
+                "GraphCredentials.client_secret nao pode ser vazio."
+            )
         if not credentials.tenant_id.strip():
-            raise ValueError("GraphCredentials.tenant_id nao pode ser vazio.")
+            raise GraphConfigurationError(
+                "GraphCredentials.tenant_id nao pode ser vazio."
+            )
 
     @staticmethod
     def _validate_scopes(scopes: Sequence[str]) -> None:
         if not scopes:
-            raise ValueError("Informe ao menos um scope do Microsoft Graph.")
+            raise GraphConfigurationError(
+                "Informe ao menos um scope do Microsoft Graph."
+            )
         for scope in scopes:
             if not isinstance(scope, str) or not scope.strip():
-                raise ValueError(
+                raise GraphConfigurationError(
                     "Cada scope do Microsoft Graph deve ser uma string nao vazia."
                 )
 
